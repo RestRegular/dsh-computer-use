@@ -13,13 +13,13 @@
 
 use std::collections::HashSet;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint,
     FillRect, FrameRect, GetDC, GetStockObject, GetTextExtentPoint32W, ReleaseDC, SelectObject,
@@ -31,13 +31,14 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PostThreadMessageW, RegisterClassExW,
-    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+    GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PostThreadMessageW, RegisterClassExW,
+    SetCursorPos, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
     ShowWindowAsync, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT,
     LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_PAINT, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_LAYERED,
+    WH_MOUSE_LL, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_MOUSEMOVE, WM_PAINT,
+    WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     GWLP_USERDATA, HWND_TOPMOST,
 };
@@ -47,11 +48,24 @@ use crate::util::{now_ms, sleep_ms, wide};
 use crate::{HelperError, HResult};
 
 const WM_TAKEOVER_END: u32 = WM_APP + 1;
+/// Posted to the overlay thread when the physical pointer dragged the system
+/// cursor away from the position the agent put it at.
+const WM_TAKEOVER_PIN: u32 = WM_APP + 0x21;
 const TINT_CLASS: &str = "DshComputerUseTakeoverTint";
 const BANNER_CLASS: &str = "DshComputerUseTakeoverBanner";
 
 /// How long `takeover.end` waits for the overlay thread to dismantle itself.
 const END_TIMEOUT_MS: u64 = 5000;
+
+/// Encoded `POINT` the agent's injected moves last asked for. The low-level
+/// mouse hook discards the human's mouse messages, but Windows still moves the
+/// system cursor for every physical move *before* the hook runs, so the mask
+/// has to pull it back here or the agent's pointer is constantly yanked to
+/// wherever the human's hand is.
+static POINTER_TARGET: AtomicI64 = AtomicI64::new(i64::MIN);
+/// Only one pull-back may be queued at a time; otherwise a 1000 Hz mouse floods
+/// the overlay thread's message queue.
+static PIN_PENDING: AtomicBool = AtomicBool::new(false);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -144,6 +158,86 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+fn same_point(left: &POINT, right: &POINT) -> bool {
+    left.x == right.x && left.y == right.y
+}
+
+fn pack_point(point: POINT) -> i64 {
+    ((point.x as u32 as i64) << 32) | (point.y as u32 as i64)
+}
+
+fn unpack_point(value: i64) -> POINT {
+    POINT { x: (value >> 32) as i32, y: value as u32 as i32 }
+}
+
+/// Remember where the agent's pointer must stay. Called for every injected
+/// move that passes the hook, so a human drag is always undone back to the
+/// last position the agent injected.
+pub fn set_pointer_target(point: POINT) {
+    POINTER_TARGET.store(pack_point(point), Ordering::SeqCst);
+}
+
+pub fn pointer_target() -> Option<POINT> {
+    let value = POINTER_TARGET.load(Ordering::SeqCst);
+    if value == i64::MIN { None } else { Some(unpack_point(value)) }
+}
+
+fn clear_pointer_target() {
+    POINTER_TARGET.store(i64::MIN, Ordering::SeqCst);
+    PIN_PENDING.store(false, Ordering::SeqCst);
+}
+
+fn current_cursor() -> Option<POINT> {
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 { None } else { Some(point) }
+}
+
+/// Queue a cursor pull-back on the overlay thread. Runs inside the low-level
+/// hook, so it must only read state and post a message: calling `SetCursorPos`
+/// from the hook callback can deadlock the raw input thread that is waiting on
+/// the hook to return.
+fn pin_pointer() {
+    let Some(target) = pointer_target() else { return };
+    let Some(current) = current_cursor() else { return };
+    if same_point(&current, &target) {
+        return;
+    }
+    if PIN_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let thread = THREAD_ID.load(Ordering::SeqCst);
+    if thread == 0 || unsafe { PostThreadMessageW(thread, WM_TAKEOVER_PIN, 0, 0) } == 0 {
+        PIN_PENDING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Undo a human cursor move. Runs on the overlay thread from its message loop,
+/// never from the hook itself.
+fn apply_pointer_pin() {
+    PIN_PENDING.store(false, Ordering::SeqCst);
+    if !ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(target) = pointer_target() else { return };
+    if let Some(current) = current_cursor() {
+        if !same_point(&current, &target) {
+            unsafe { SetCursorPos(target.x, target.y) };
+        }
+    }
+}
+
+/// Test hook: run the deferred pull-back immediately, the way the message loop
+/// would after the physical pointer moved.
+pub fn debug_pin() {
+    apply_pointer_pin();
+}
+
+/// Test hook: queue the pull-back through the real hook path (compare, post,
+/// message loop, `SetCursorPos`) without needing a physical mouse.
+pub fn debug_post_pin() {
+    pin_pointer();
+}
+
 /// Route helper-to-host events ("takeover.ended") to the protocol writer.
 pub fn set_event_sink(sink: fn(&str, Value)) {
     let _ = EVENT_SINK.set(sink);
@@ -207,6 +301,7 @@ pub fn status_value() -> Value {
         "hotkey": crate::hotkey::current_label(),
         "composing": is_composing(),
         "chat": crate::chat::snapshot_value(),
+        "pointer": pointer_target().map(|point| json!({ "x": point.x, "y": point.y })),
         "hooks": {
             "keysBlocked": HOOK_KEYS_BLOCKED.load(Ordering::SeqCst),
             "mouseBlocked": HOOK_MOUSE_BLOCKED.load(Ordering::SeqCst),
@@ -536,10 +631,20 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
     }
     let info = &*(lparam as *const MSLLHOOKSTRUCT);
-    if ACTIVE.load(Ordering::SeqCst) && (info.flags & LLMHF_INJECTED) == 0 {
+    if ACTIVE.load(Ordering::SeqCst) {
+        if (info.flags & LLMHF_INJECTED) != 0 {
+            // The agent's own moves define where the OS cursor has to stay.
+            if wparam as u32 == WM_MOUSEMOVE {
+                set_pointer_target(info.pt);
+            }
+            return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
+        }
         // The human's physical pointer is rendered and hit-tested by the mask
         // chat panel; the OS cursor stays wherever the agent put it.
         crate::chat::on_physical_mouse(wparam as u32, info.pt);
+        // Windows moves the system cursor for the physical move before this
+        // hook sees it; queue a pull-back to the agent's position.
+        pin_pointer();
         HOOK_MOUSE_BLOCKED.fetch_add(1, Ordering::SeqCst);
         return 1;
     }
@@ -686,6 +791,12 @@ fn takeover_thread(config: TakeoverConfig, init: mpsc::Sender<Result<InitInfo, S
     HOTKEY_FIRED.store(false, Ordering::SeqCst);
     HOOK_KEYS_BLOCKED.store(0, Ordering::SeqCst);
     HOOK_MOUSE_BLOCKED.store(0, Ordering::SeqCst);
+    // Until the agent injects its first move, the cursor is pinned where it
+    // already was so the human cannot drag it around under the mask.
+    clear_pointer_target();
+    if let Some(cursor) = current_cursor() {
+        set_pointer_target(cursor);
+    }
 
     let session = match Session::create(config) {
         Ok(session) => {
@@ -745,6 +856,10 @@ fn message_loop() {
         if message.message == WM_TAKEOVER_END {
             break;
         }
+        if message.message == WM_TAKEOVER_PIN {
+            apply_pointer_pin();
+            continue;
+        }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -759,6 +874,7 @@ fn reset_generation(generation: u64) {
         CAPTURE_EXCLUDED.store(false, Ordering::SeqCst);
         PREVIEW.store(false, Ordering::SeqCst);
         THREAD_ID.store(0, Ordering::SeqCst);
+        clear_pointer_target();
         finish_composing();
     }
 }

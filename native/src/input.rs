@@ -141,13 +141,20 @@ fn check_ready() -> HResult<()> {
             "mouse and keyboard input requires an active consent takeover; the host must show the mask first",
         ));
     }
+    if !cursor_movable() {
+        return Err(HelperError::new(
+            "INPUT_RESTRICTED",
+            "the helper is running with a restricted (low-integrity) token, so Windows ignores its mouse and keyboard input. Start DSH from a normal desktop session (not from a sandboxed or restricted shell)",
+        ));
+    }
     Ok(())
 }
 
 pub fn move_to(x: i32, y: i32) -> HResult<()> {
     check_ready()?;
     let (dx, dy) = absolute((x, y));
-    send(&[mouse_event(dx, dy, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)])
+    send(&[mouse_event(dx, dy, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)])?;
+    Ok(())
 }
 
 pub fn move_relative(dx: i32, dy: i32) -> HResult<()> {
@@ -478,16 +485,39 @@ pub fn raw_move_relative(dx: i32, dy: i32) -> HResult<()> {
 #[link(name = "user32")]
 extern "system" {
     fn SetCursorPos(x: i32, y: i32) -> i32;
+    fn GetCursorPos(point: *mut windows_sys::Win32::Foundation::POINT) -> i32;
     fn GetProcessWindowStation() -> isize;
     fn GetThreadDesktop(thread_id: u32) -> isize;
     fn GetUserObjectInformationW(handle: isize, index: i32, info: *mut core::ffi::c_void, length: u32, needed: *mut u32) -> i32;
 }
 
 pub fn set_cursor(x: i32, y: i32) -> HResult<()> {
+    set_cursor_raw(x, y)?;
+    crate::takeover::set_pointer_target(windows_sys::Win32::Foundation::POINT { x, y });
+    Ok(())
+}
+
+/// Move the cursor without telling the takeover where the agent's pointer now
+/// is. The test protocol uses it to fake a physical drag.
+pub fn set_cursor_raw(x: i32, y: i32) -> HResult<()> {
     if unsafe { SetCursorPos(x, y) } == 0 {
         return Err(HelperError::new("INPUT_FAILED", format!("SetCursorPos failed: {}", last_error())));
     }
     Ok(())
+}
+
+/// True when this process is allowed to move the system cursor. A helper that
+/// inherits a low-integrity label (e.g. launched from a sandboxed workspace)
+/// silently fails to move it; the host warns instead of appearing to work.
+pub fn cursor_movable() -> bool {
+    static MOVABLE: OnceLock<bool> = OnceLock::new();
+    *MOVABLE.get_or_init(|| {
+        let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return false;
+        }
+        unsafe { SetCursorPos(point.x, point.y) != 0 }
+    })
 }
 
 fn object_name(handle: isize) -> String {

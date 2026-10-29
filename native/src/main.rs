@@ -100,6 +100,7 @@ fn hello() -> HResult<Value> {
         "elevated": util::is_elevated(),
         "dpiAware": true,
         "secureDesktop": util::is_secure_desktop(),
+        "cursorMovable": input::cursor_movable(),
         "paused": hotkey::is_paused(),
         "hotkey": hotkey::current_label(),
         "takeover": takeover::status_value(),
@@ -243,6 +244,25 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
         "debug.desktop" => Ok(input::desktop_names()),
         "debug.env" => Ok(input::env_info()),
         "debug.token" => Ok(input::token_info()),
+        "debug.pin_pointer" => {
+            takeover::debug_pin();
+            Ok(json!({ "cursor": capture::cursor(), "takeover": takeover::status_value() }))
+        }
+        "debug.pin_post" => {
+            takeover::debug_post_pin();
+            util::sleep_ms(50);
+            Ok(json!({ "cursor": capture::cursor(), "takeover": takeover::status_value() }))
+        }
+        "debug.cursor_force" => {
+            // Move the cursor the way the human's hand would: without updating
+            // the takeover's pointer target, so `debug.pin_pointer` can prove
+            // the pull-back works.
+            let x = int_param(params, "x")?;
+            let y = int_param(params, "y")?;
+            input::set_cursor_raw(x, y)?;
+            util::sleep_ms(30);
+            Ok(json!({ "cursor": capture::cursor() }))
+        }
         "debug.set_cursor_thread" => {
             let _guard = takeover::input_guard()?;
             let x = int_param(params, "x")?;

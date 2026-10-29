@@ -122,6 +122,25 @@ try {
   await call('mouse.move', { x: before.cursor.x, y: before.cursor.y });
   console.log('injected input passes through the mask:', `${before.cursor.x},${before.cursor.y}`, '->', `${after.cursor.x},${after.cursor.y}`);
 
+  // A physical mouse move still moves the system cursor before the hook sees
+  // it; the takeover must pull it back to where the agent put it.
+  await call('mouse.move', { x: 700, y: 500 });
+  await sleep(80);
+  const pointer = (await call('takeover.status')).pointer;
+  if (!pointer) throw new Error('the takeover did not record the agent pointer target');
+  await call('debug.cursor_force', { x: 1200, y: 800 });
+  await sleep(80);
+  const dragged = await call('status');
+  await call('debug.pin_post');
+  await sleep(120);
+  const pinned = await call('status');
+  if (pinned.cursor.x !== pointer.x || pinned.cursor.y !== pointer.y) {
+    throw new Error(
+      `the mask did not pull the cursor back: target ${pointer.x},${pointer.y}, dragged ${dragged.cursor.x},${dragged.cursor.y}, now ${pinned.cursor.x},${pinned.cursor.y}`,
+    );
+  }
+  console.log('physical drag is undone:', `${dragged.cursor.x},${dragged.cursor.y}`, '->', `${pinned.cursor.x},${pinned.cursor.y}`);
+
   await sleep(500);
   const normal = await call('screenshot', { target: 'screen', format: 'png', max_edge: 1600 });
   writeFileSync(join(root, 'native', 'mask-hidden.png'), Buffer.from(normal.data, 'base64'));

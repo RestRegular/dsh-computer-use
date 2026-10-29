@@ -37,6 +37,12 @@ pub fn current_label() -> String {
     label().lock().unwrap_or_else(|error| error.into_inner()).clone()
 }
 
+/// Virtual-key codes of the polling combination. The takeover keyboard hook
+/// forwards exactly these keys, so the emergency hotkey is never discarded.
+pub fn codes() -> Vec<i32> {
+    keys().lock().unwrap_or_else(|error| error.into_inner()).clone()
+}
+
 /// Replace the polling combination. Names are the same names accepted by
 /// `input::vk_for_name` (ctrl, alt, shift, win, f1..f24, letters, digits).
 pub fn set_from_names(names: &[String]) -> Result<(), String> {
@@ -63,10 +69,16 @@ pub fn start() {
                     (GetAsyncKeyState(*code) as u16 & 0x8000) != 0
                 });
             if down && !was_down {
-                let next = !is_paused();
-                set_paused(next);
-                if next {
-                    let _ = crate::input::release_all();
+                if crate::takeover::is_active() {
+                    // While the agent holds the desktop, the emergency hotkey
+                    // ends the takeover and fails closed (PAUSED stays on).
+                    crate::takeover::emergency_stop("hotkey");
+                } else {
+                    let next = !is_paused();
+                    set_paused(next);
+                    if next {
+                        let _ = crate::input::release_all();
+                    }
                 }
             }
             was_down = down;

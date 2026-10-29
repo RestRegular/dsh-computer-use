@@ -117,6 +117,12 @@ fn send(events: &[INPUT]) -> HResult<()> {
 }
 
 fn check_ready() -> HResult<()> {
+    if crate::takeover::is_cancelled() {
+        return Err(HelperError::new(
+            "TAKEOVER_ENDED",
+            "the human ended the takeover with the emergency hotkey; stop operating and wait for a new approval",
+        ));
+    }
     if crate::hotkey::is_paused() {
         return Err(HelperError::new(
             "PAUSED",
@@ -127,6 +133,12 @@ fn check_ready() -> HResult<()> {
         return Err(HelperError::new(
             "SECURE_DESKTOP",
             "the current desktop is locked or showing a secure prompt",
+        ));
+    }
+    if crate::takeover::input_required() && !crate::takeover::is_active() {
+        return Err(HelperError::new(
+            "TAKEOVER_REQUIRED",
+            "mouse and keyboard input requires an active consent takeover; the host must show the mask first",
         ));
     }
     Ok(())

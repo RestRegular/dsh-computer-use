@@ -7,12 +7,26 @@ mod capture;
 mod clipboard;
 mod hotkey;
 mod input;
+mod takeover;
 mod util;
 mod window;
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
+use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+
+/// stdout is shared with the takeover thread, which emits `takeover.ended`
+/// events while the main thread may be writing a response. One lock per frame
+/// keeps the line-delimited protocol intact.
+static OUTPUT: OnceLock<Mutex<std::io::Stdout>> = OnceLock::new();
+
+fn emit_event(name: &str, data: Value) {
+    let Some(output) = OUTPUT.get() else { return };
+    if let Ok(mut out) = output.lock() {
+        write_frame(&mut *out, &json!({ "event": name, "data": data }));
+    }
+}
 
 #[derive(Debug)]
 pub struct HelperError {
@@ -87,6 +101,7 @@ fn hello() -> HResult<Value> {
         "secureDesktop": util::is_secure_desktop(),
         "paused": hotkey::is_paused(),
         "hotkey": hotkey::current_label(),
+        "takeover": takeover::status_value(),
         "at": util::now_ms(),
         "monitors": capture::monitors()?,
     }))
@@ -100,6 +115,7 @@ fn status() -> HResult<Value> {
         "hotkey": hotkey::current_label(),
         "elevated": util::is_elevated(),
         "secureDesktop": util::is_secure_desktop(),
+        "takeover": takeover::status_value(),
         "cursor": capture::cursor(),
         "foreground": foreground,
         "monitors": capture::monitors()?,
@@ -112,7 +128,32 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
         "hello" => hello(),
         "status" => status(),
         "monitors" => capture::monitors(),
-        "screenshot" => capture::screenshot(params),
+        "screenshot" => {
+            // SetWindowDisplayAffinity keeps the takeover mask out of captures
+            // on Windows 10 2004+. Where that is unavailable, hide the overlay
+            // for the duration of the capture instead.
+            let hidden = takeover::hide_for_capture();
+            let result = capture::screenshot(params);
+            takeover::finish_capture(hidden);
+            result
+        }
+        "takeover.begin" => takeover::begin(params),
+        "takeover.end" => {
+            let reason = params.get("reason").and_then(Value::as_str).unwrap_or("host");
+            takeover::end(reason)
+        }
+        "takeover.status" => Ok(takeover::status_value()),
+        "debug.emergency" => {
+            let reason = params.get("reason").and_then(Value::as_str).unwrap_or("debug");
+            takeover::emergency_stop(reason);
+            Ok(takeover::status_value())
+        }
+        "debug.mask_capture" => {
+            takeover::disable_capture_exclusion();
+            let result = capture::screenshot(params);
+            takeover::restore_capture_exclusion();
+            result
+        }
         "windows.list" => window::list(),
         "window.focus" => {
             let id = string_param(params, "window_id")?;
@@ -221,7 +262,10 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             if let Some(combos) = params.get("blocked_combos").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(ToString::to_string).collect::<Vec<String>>()) {
                 input::set_blocked(combos);
             }
-            Ok(json!({ "hotkey": hotkey::current_label() }))
+            if let Some(required) = params.get("require_takeover").and_then(Value::as_bool) {
+                takeover::set_input_required(required);
+            }
+            Ok(json!({ "hotkey": hotkey::current_label(), "takeoverRequired": takeover::input_required() }))
         }
         other => Err(HelperError::new("UNKNOWN_METHOD", format!("unknown method: {other}"))),
     }
@@ -234,6 +278,8 @@ fn write_frame(out: &mut impl Write, frame: &Value) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    OUTPUT.set(Mutex::new(std::io::stdout())).ok();
+    takeover::set_event_sink(emit_event);
     if !args.iter().any(|arg| arg == "--no-dpi") {
         unsafe {
             let ok = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -244,7 +290,7 @@ fn main() {
         hotkey::start();
     }
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let output = OUTPUT.get();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -253,10 +299,14 @@ fn main() {
         let request: Value = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                write_frame(
-                    &mut stdout,
-                    &json!({ "id": Value::Null, "ok": false, "error": { "code": "BAD_JSON", "message": error.to_string() } }),
-                );
+                if let Some(output) = output {
+                    if let Ok(mut out) = output.lock() {
+                        write_frame(
+                            &mut *out,
+                            &json!({ "id": Value::Null, "ok": false, "error": { "code": "BAD_JSON", "message": error.to_string() } }),
+                        );
+                    }
+                }
                 continue;
             }
         };
@@ -264,7 +314,11 @@ fn main() {
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(Value::Null);
         if method == "shutdown" {
-            write_frame(&mut stdout, &json!({ "id": id, "ok": true, "result": { "bye": true } }));
+            if let Some(output) = output {
+                if let Ok(mut out) = output.lock() {
+                    write_frame(&mut *out, &json!({ "id": id, "ok": true, "result": { "bye": true } }));
+                }
+            }
             break;
         }
         let response = match dispatch(method, &params) {
@@ -275,7 +329,12 @@ fn main() {
                 "error": { "code": error.code, "message": error.message },
             }),
         };
-        write_frame(&mut stdout, &response);
+        if let Some(output) = output {
+            if let Ok(mut out) = output.lock() {
+                write_frame(&mut *out, &response);
+            }
+        }
     }
+    takeover::shutdown();
     let _ = input::release_all();
 }

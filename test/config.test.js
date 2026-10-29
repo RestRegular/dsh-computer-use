@@ -11,6 +11,40 @@ test('defaults are complete and stable', () => {
   assert.deepEqual(config.input.blockedCombos, ['win+l', 'ctrl+alt+del', 'win+u']);
   assert.deepEqual(config.safety.allowedProcesses, []);
   assert.equal(config.input.requireApproval, false);
+  // Consent and takeover are on by default: the agent asks before input and
+  // the screen is masked while it operates.
+  assert.equal(config.consent.requireApproval, true);
+  assert.equal(config.consent.scope, 'turn');
+  assert.equal(config.takeover.enabled, true);
+  assert.equal(config.takeover.opacity, 0.18);
+  assert.equal(config.takeover.banner, true);
+  assert.equal(config.takeover.title, '');
+  assert.equal(config.takeover.idleEndMs, 0);
+});
+
+test('the legacy input.requireApproval still enables consent', () => {
+  const config = normalizeConfig({ input: { requireApproval: true } });
+  assert.equal(config.consent.requireApproval, true);
+  assert.equal(config.input.requireApproval, true);
+  const optedOut = normalizeConfig({ consent: { requireApproval: false } });
+  assert.equal(optedOut.consent.requireApproval, false);
+});
+
+test('takeover and consent overrides are validated', () => {
+  const config = normalizeConfig({
+    consent: { scope: 'session' },
+    takeover: { opacity: 0.4, title: 'Busy', hint: 'Stop with F12', idleEndMs: 60000, banner: false },
+  });
+  assert.equal(config.consent.scope, 'session');
+  assert.equal(config.takeover.opacity, 0.4);
+  assert.equal(config.takeover.title, 'Busy');
+  assert.equal(config.takeover.hint, 'Stop with F12');
+  assert.equal(config.takeover.idleEndMs, 60000);
+  assert.equal(config.takeover.banner, false);
+  assert.throws(() => normalizeConfig({ takeover: { opacity: 0 } }), /takeover.opacity/);
+  assert.throws(() => normalizeConfig({ takeover: { opacity: 1 } }), /takeover.opacity/);
+  assert.throws(() => normalizeConfig({ consent: { scope: 'week' } }), /consent.scope/);
+  assert.throws(() => normalizeConfig({ takeover: { idleEndMs: -1 } }), /idleEndMs/);
 });
 
 test('partial nested overrides keep unrelated defaults', () => {

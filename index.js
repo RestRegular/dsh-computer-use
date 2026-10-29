@@ -8,6 +8,7 @@
 
 import { Config, normalizeConfig } from './lib/config.js';
 import { HelperClient } from './lib/helper-client.js';
+import { ComputerControl, registerControlLifecycle } from './lib/control.js';
 import { registerTools } from './lib/tools.js';
 import { registerGuidance } from './lib/prompt.js';
 import { registerApproval } from './lib/approval.js';
@@ -32,11 +33,22 @@ export function apply(ctx, rawConfig) {
   }
 
   const helper = new HelperClient(ctx, config);
-  ctx.effect(() => () => helper.stop());
+  const control = new ComputerControl(ctx, helper, config);
+  control.attach();
+  if (config.consent.requireApproval) {
+    ctx.logger?.info?.(
+      '[dsh-computer-use] input actions ask for approval; the session approval policy must be "ask" (with "never" they are refused)',
+    );
+  }
+  ctx.effect(() => () => {
+    control.dispose();
+    helper.stop();
+  });
 
-  registerTools(ctx, helper, config);
+  registerTools(ctx, helper, config, control);
   registerGuidance(ctx, config);
-  registerApproval(ctx, config);
+  registerApproval(ctx, config, control);
+  registerControlLifecycle(ctx, control);
 
   // Register as the optional shared computer-use provider when the official
   // registry happens to be mounted. A second provider is a profile conflict;

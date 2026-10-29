@@ -119,6 +119,10 @@ pub fn monitors() -> HResult<serde_json::Value> {
     }))
 }
 
+pub fn monitor_count() -> HResult<usize> {
+    Ok(monitor_list()?.len())
+}
+
 fn cursor_info() -> CursorInfo {
     let mut info: CURSORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;

@@ -67,14 +67,15 @@ static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 static HOOK_KEYS_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static HOOK_MOUSE_BLOCKED: AtomicU64 = AtomicU64::new(0);
-static DOWN_KEYS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static DOWN_KEYS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+static HOTKEY_FIRED: AtomicBool = AtomicBool::new(false);
 static CONTROL: Mutex<()> = Mutex::new(());
 static THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 static END_REASON: Mutex<Option<String>> = Mutex::new(None);
 static END_TX: Mutex<Option<mpsc::Sender<(bool, String)>>> = Mutex::new(None);
 static EVENT_SINK: OnceLock<fn(&str, Value)> = OnceLock::new();
 
-fn down_keys() -> &'static Mutex<HashSet<u32>> {
+fn down_keys() -> &'static Mutex<HashSet<i32>> {
     DOWN_KEYS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
@@ -428,12 +429,25 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
     }
     // Never discard the emergency hotkey: forward every key that belongs to
-    // the combination so the polling hotkey thread still sees the press.
-    if crate::hotkey::codes().contains(&(info.vkCode as i32)) {
-        if wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN {
-            lock(down_keys()).insert(info.vkCode);
-        } else {
-            lock(down_keys()).remove(&info.vkCode);
+    // the combination so the polling hotkey thread still sees the press. The
+    // hook also detects the completed combination itself — a low-level hook
+    // reports side-specific modifier codes (`VK_LCONTROL`) and a swallowed key
+    // never reaches `GetAsyncKeyState`, so polling alone could miss the press.
+    if crate::hotkey::matches(info.vkCode as i32) {
+        let key = crate::hotkey::normalize(info.vkCode as i32);
+        let complete = {
+            let mut held = lock(down_keys());
+            if wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN {
+                held.insert(key);
+            } else {
+                held.remove(&key);
+            }
+            crate::hotkey::satisfied(&held)
+        };
+        if complete && !HOTKEY_FIRED.swap(true, Ordering::SeqCst) {
+            // `release_all()` injects input, so never run it inside the hook
+            // callback: end the takeover from a short-lived thread instead.
+            thread::spawn(|| crate::takeover::emergency_stop("hotkey"));
         }
         return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
     }
@@ -572,6 +586,7 @@ fn takeover_thread(config: TakeoverConfig, init: mpsc::Sender<Result<InitInfo, S
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
     down_keys().lock().unwrap_or_else(|error| error.into_inner()).clear();
+    HOTKEY_FIRED.store(false, Ordering::SeqCst);
     HOOK_KEYS_BLOCKED.store(0, Ordering::SeqCst);
     HOOK_MOUSE_BLOCKED.store(0, Ordering::SeqCst);
 

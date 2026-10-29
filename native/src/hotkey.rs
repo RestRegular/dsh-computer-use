@@ -5,6 +5,7 @@
 //! Pressing it toggles PAUSED, releases every button/modifier the helper may
 //! have left down, and refuses further input until the human presses it again.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -43,6 +44,52 @@ pub fn codes() -> Vec<i32> {
     keys().lock().unwrap_or_else(|error| error.into_inner()).clone()
 }
 
+/// Map the side-specific modifier codes a low-level keyboard hook reports
+/// (`VK_LCONTROL`/`VK_RCONTROL`, `VK_LSHIFT`/..., `VK_LMENU`/...) onto the
+/// generic codes the configuration uses (`ctrl`, `shift`, `alt`). A hook that
+/// only compared raw codes used to swallow `Ctrl`/`Alt`/`Shift`, which also
+/// kept `GetAsyncKeyState` from ever seeing the combination.
+pub fn normalize(code: i32) -> i32 {
+    match code {
+        0xA0 | 0xA1 => 0x10,
+        0xA2 | 0xA3 => 0x11,
+        0xA4 | 0xA5 => 0x12,
+        other => other,
+    }
+}
+
+/// True when `code` (raw or side-specific) belongs to the polling combination.
+pub fn matches(code: i32) -> bool {
+    let code = normalize(code);
+    codes().iter().any(|configured| *configured == code)
+}
+
+/// True when every key of the combination is held down in `pressed`.
+pub fn satisfied(pressed: &HashSet<i32>) -> bool {
+    let held: HashSet<i32> = pressed.iter().copied().map(normalize).collect();
+    let codes = codes();
+    !codes.is_empty() && codes.iter().all(|code| held.contains(code))
+}
+
+fn pressed(vk: i32) -> bool {
+    unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+}
+
+/// Poll one configured key. Side-specific states are checked as well because a
+/// forwarded `VK_LCONTROL` is not always mirrored on the generic `VK_CONTROL`.
+fn is_down(code: i32) -> bool {
+    let code = normalize(code);
+    if pressed(code) {
+        return true;
+    }
+    match code {
+        0x10 => pressed(0xA0) || pressed(0xA1),
+        0x11 => pressed(0xA2) || pressed(0xA3),
+        0x12 => pressed(0xA4) || pressed(0xA5),
+        _ => false,
+    }
+}
+
 /// Replace the polling combination. Names are the same names accepted by
 /// `input::vk_for_name` (ctrl, alt, shift, win, f1..f24, letters, digits).
 pub fn set_from_names(names: &[String]) -> Result<(), String> {
@@ -64,10 +111,7 @@ pub fn start() {
         let mut was_down = false;
         loop {
             let codes = keys().lock().unwrap_or_else(|error| error.into_inner()).clone();
-            let down = !codes.is_empty()
-                && codes.iter().all(|code| unsafe {
-                    (GetAsyncKeyState(*code) as u16 & 0x8000) != 0
-                });
+            let down = !codes.is_empty() && codes.iter().all(|code| is_down(*code));
             if down && !was_down {
                 if crate::takeover::is_active() {
                     // While the agent holds the desktop, the emergency hotkey

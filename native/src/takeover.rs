@@ -709,6 +709,11 @@ pub fn begin(params: &Value) -> HResult<Value> {
             return Err(HelperError::new("TAKEOVER_FAILED", "the takeover overlay did not start in time"));
         }
     };
+    // A human may still be holding a modifier or a mouse button from the click
+    // that approved the takeover. Release that physical state now (the key-up
+    // events themselves are swallowed by the hooks) so the agent's injected
+    // input cannot be altered by a stuck Ctrl/Shift/Alt/Win or button.
+    let _ = crate::input::release_all();
     Ok(json!({
         "active": true,
         "since": SINCE.load(Ordering::SeqCst),

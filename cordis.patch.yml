@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-computer-use
+      name: '@restregular/dsh-computer-use'
+      config: {}

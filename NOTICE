@@ -1,0 +1,13 @@
+Third-party notices
+===================
+
+The published package contains a compiled Rust helper built from native/Cargo.toml.
+The helper links the following crates, each distributed under its own license:
+
+- serde, serde_json — MIT OR Apache-2.0
+- base64 — MIT OR Apache-2.0
+- image — MIT OR Apache-2.0
+- windows-sys — MIT OR Apache-2.0
+
+The source and Cargo.lock live in the GitHub repository. No third-party source
+or assets are vendored into this package; the icon is original artwork.

@@ -1,0 +1,8 @@
+node_modules/
+native/target/
+native/*.png
+*.log
+.DS_Store
+Thumbs.db
+.dsh/
+*.tgz

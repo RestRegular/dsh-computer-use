@@ -1,0 +1,64 @@
+{
+  "name": "@restregular/dsh-computer-use",
+  "version": "0.1.0",
+  "description": "Windows computer use for DeepSeek Harness: screenshots, mouse, keyboard, windows and clipboard through a native helper.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib/**/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "native/bin/win32-x64/dsh-computer-use-helper.exe",
+    "README.md",
+    "README.zh.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.19",
+    "dsh": ">=0.2.1-rc.3 <0.3.0"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "computer-use",
+    "windows",
+    "automation",
+    "screenshot",
+    "mouse",
+    "keyboard"
+  ],
+  "author": "RestRegular",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RestRegular/dsh-computer-use.git"
+  },
+  "homepage": "https://github.com/RestRegular/dsh-computer-use#readme",
+  "bugs": {
+    "url": "https://github.com/RestRegular/dsh-computer-use/issues"
+  }
+}

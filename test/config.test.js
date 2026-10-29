@@ -36,3 +36,24 @@ test('standard schema exposes the normalizer', () => {
   assert.ok(Array.isArray(failure.issues));
   assert.ok(JSON.parse(JSON.stringify(Config)).dict.enabled);
 });
+
+test('every Config node has meta so settings/describe cannot throw', () => {
+  const visit = (node) => {
+    assert.equal(typeof node.meta, 'object', `missing meta on ${node.type}`);
+    for (const child of Object.values(node.dict ?? {})) visit(child);
+    if (node.inner) visit(node.inner);
+    if (node.items) visit(node.items);
+  };
+  visit(Config);
+  assert.equal(Config.meta.volatile, undefined);
+  assert.equal(Config.dict.screenshot.meta.volatile, true);
+  const volatileForm = (schema) => {
+    if (schema.meta.volatile) return true;
+    if (schema.type === 'object') {
+      return Object.values(schema.dict ?? {}).some((child) => volatileForm(child));
+    }
+    return false;
+  };
+  assert.doesNotThrow(() => volatileForm(Config));
+  assert.equal(volatileForm(Config), true);
+});

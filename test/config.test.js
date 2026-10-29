@@ -18,6 +18,7 @@ test('defaults are complete and stable', () => {
   assert.equal(config.takeover.enabled, true);
   assert.equal(config.takeover.opacity, 0.18);
   assert.equal(config.takeover.banner, true);
+  assert.equal(config.takeover.chat, true);
   assert.equal(config.takeover.title, '');
   assert.equal(config.takeover.idleEndMs, 0);
 });
@@ -33,7 +34,7 @@ test('the legacy input.requireApproval still enables consent', () => {
 test('takeover and consent overrides are validated', () => {
   const config = normalizeConfig({
     consent: { scope: 'session' },
-    takeover: { opacity: 0.4, title: 'Busy', hint: 'Stop with F12', idleEndMs: 60000, banner: false },
+    takeover: { opacity: 0.4, title: 'Busy', hint: 'Stop with F12', idleEndMs: 60000, banner: false, chat: false },
   });
   assert.equal(config.consent.scope, 'session');
   assert.equal(config.takeover.opacity, 0.4);
@@ -41,6 +42,7 @@ test('takeover and consent overrides are validated', () => {
   assert.equal(config.takeover.hint, 'Stop with F12');
   assert.equal(config.takeover.idleEndMs, 60000);
   assert.equal(config.takeover.banner, false);
+  assert.equal(config.takeover.chat, false);
   assert.throws(() => normalizeConfig({ takeover: { opacity: 0 } }), /takeover.opacity/);
   assert.throws(() => normalizeConfig({ takeover: { opacity: 1 } }), /takeover.opacity/);
   assert.throws(() => normalizeConfig({ consent: { scope: 'week' } }), /consent.scope/);

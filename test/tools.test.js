@@ -34,6 +34,9 @@ function harness(config = normalizeConfig({})) {
     async ensure(agentId) {
       this.ensured.push(String(agentId));
     },
+    async waitForCompose() {
+      return true;
+    },
     async release(agentId) {
       this.released.push(String(agentId));
       return true;
@@ -94,4 +97,58 @@ test('release reports the takeover state and hands control back', async () => {
   assert.equal(control.ensured.length, 0);
   assert.deepEqual(result, { ok: true, action: 'release', released: true, takeover: { active: true } });
   assert.deepEqual(requests, []);
+});
+
+test('input waits and retries while the mask panel is composing', async () => {
+  const definitions = [];
+  const ctx = {
+    logger: { info() {}, warn() {}, debug() {} },
+    get() {
+      return undefined;
+    },
+    effect(fn) {
+      fn();
+    },
+    tools: {
+      register(definition) {
+        definitions.push(definition);
+        return () => {};
+      },
+    },
+  };
+  let attempts = 0;
+  const helper = {
+    async request(method) {
+      if (method === 'mouse.click') {
+        attempts += 1;
+        if (attempts === 1) {
+          throw Object.assign(new Error('[HUMAN_COMPOSING] typing'), { code: 'HUMAN_COMPOSING' });
+        }
+      }
+      return { ok: true };
+    },
+  };
+  let waits = 0;
+  const control = {
+    async ensure() {},
+    async release() {
+      return true;
+    },
+    isActive() {
+      return true;
+    },
+    async waitForCompose() {
+      waits += 1;
+      return true;
+    },
+  };
+  registerTools(ctx, helper, normalizeConfig({}), control);
+  const action = definitions.find((definition) => definition.name === 'computer_action');
+  const result = await action.execute(
+    { action: 'click', x: 10, y: 10, coordinate_space: 'screen' },
+    { agent: { id: 'agent-a' }, signal: new AbortController().signal },
+  );
+  assert.equal(result.ok, true);
+  assert.equal(attempts, 2);
+  assert.ok(waits >= 1);
 });

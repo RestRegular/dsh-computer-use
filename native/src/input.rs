@@ -191,6 +191,7 @@ pub fn click(button: Button, clicks: u32, hold_ms: u64, point: Option<(i32, i32)
         move_to(x, y)?;
     }
     for index in 0..clicks.clamp(1, 3) {
+        check_ready()?;
         send(&[mouse_event(0, 0, 0, button.down())])?;
         if hold_ms > 0 {
             sleep_ms(hold_ms);
@@ -414,6 +415,9 @@ pub fn type_text(text: &str, interval_ms: u64) -> HResult<()> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let interval = interval_ms.min(1000);
     for character in normalized.chars() {
+        // A long `type` must stop as soon as the human cancels the takeover or
+        // presses the emergency hotkey, not after the remaining characters.
+        check_ready()?;
         if character == '\n' {
             press(&["enter".to_string()])?;
         } else if character == '\t' {

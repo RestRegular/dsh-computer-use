@@ -1,7 +1,7 @@
 {
   "name": "@restregular/dsh-computer-use",
-  "version": "0.2.2",
-  "description": "Windows computer use for DeepSeek Harness: consented screen takeover with a mask, plus screenshots, mouse, keyboard, windows and clipboard through a native helper.",
+  "version": "0.3.0",
+  "description": "Windows computer use for DeepSeek Harness: consented screen takeover with an interactive mask chat panel, plus screenshots, mouse, keyboard, windows and clipboard through a native helper.",
   "type": "module",
   "main": "index.js",
   "exports": {

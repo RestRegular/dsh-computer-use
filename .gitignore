@@ -6,3 +6,4 @@ native/*.png
 Thumbs.db
 .dsh/
 *.tgz
+.dsh-probe/

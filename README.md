@@ -2,7 +2,7 @@
 
 [中文](README.zh.md) | English
 
-Let DeepSeek Harness agents see and operate a real Windows desktop: screenshots, mouse, keyboard, windows and clipboard — behind an explicit human approval and a screen takeover that keeps the human out until the agent is done. A small bundled Rust helper does the native work; no browser or external automation runtime is required.
+Let DeepSeek Harness agents see and operate a real Windows desktop: screenshots, mouse, keyboard, windows and clipboard — behind an explicit human approval and a screen takeover. The mask is not a dead end for the human: it draws its own pointer and hosts a small chat panel, so the human can message the requesting session or cancel the takeover without touching the desktop the agent is driving. A small bundled Rust helper does the native work; no browser or external automation runtime is required.
 
 ## Install
 
@@ -41,23 +41,34 @@ Requirements: Windows 10/11 x64, DSH 0.2.1 or newer.
 1. **Consent.** The first mouse/keyboard action of each turn goes through the harness approval prompt. This requires the session approval policy to be `ask`; with `never` the prompt is refused automatically and the agent cannot operate (fail closed). Set `consent.scope: session` to keep one approval for the whole session, or `consent.requireApproval: false` to remove the gate entirely.
 2. **Takeover.** After approval, the helper takes over before the first injected input:
    - a semi-transparent mask covers the whole virtual desktop, with a banner showing the title and the emergency hotkey;
-   - low-level `WH_KEYBOARD_LL` / `WH_MOUSE_LL` hooks discard every **physical** mouse and keyboard event, so the human cannot operate the machine while the agent works;
-   - input injected by the agent with `SendInput` carries the `injected` flag and passes through, so the agent keeps working behind the mask;
-   - the overlay uses `WDA_EXCLUDEFROMCAPTURE`, so it never pollutes model screenshots (on older Windows the mask is briefly hidden for the capture instead);
-   - the mask is click-through and never takes keyboard focus.
-3. **Ending.** Control returns to the human when the agent turn closes, when the agent calls `computer_action` with `action: "release"`, when the agent is disposed, on an emergency hotkey, or if the helper exits. `takeover.idleEndMs` can release the takeover after inactivity.
+   - low-level `WH_KEYBOARD_LL` / `WH_MOUSE_LL` hooks stop every **physical** event from reaching the desktop. Instead of being discarded, the human's pointer is drawn as a simulated cursor on the mask and its clicks are handled by the mask's chat panel (message box, Send, Cancel takeover);
+   - clicking the message box gives the panel's multiline EDIT the keyboard focus, so physical keys (including the system IME) go into the message, never into the app the agent is operating. While that focus is held, injected input is refused with `HUMAN_COMPOSING`; the agent's next input action waits for the panel to close and retries;
+   - input injected by the agent with `SendInput` carries the `injected` flag and passes through, so the agent keeps working behind the mask; the panel is click-through, so injected clicks reach the app even under it;
+   - the overlay uses `WDA_EXCLUDEFROMCAPTURE`, so neither the mask, the panel nor the simulated pointer pollutes model screenshots (on older Windows they are briefly hidden for the capture instead);
+   - the mask itself never takes keyboard focus; only the chat panel does, and only while the human is typing.
+3. **Ending.** Control returns to the human when the agent turn closes, when the agent calls `computer_action` with `action: "release"`, when the agent is disposed, when the human clicks **Cancel takeover** in the mask, on an emergency hotkey, or if the helper exits. `takeover.idleEndMs` can release the takeover after inactivity.
 4. **Emergency stop.** While the takeover is active, pressing the emergency hotkey (default `Ctrl+Alt+Shift+F12`) immediately ends the takeover, restores human input, pauses the helper and revokes the turn approval. The in-flight action fails with `TAKEOVER_ENDED`; later input fails with `PAUSED`. The model cannot resume: the human presses the hotkey again to clear `PAUSED`, and the next input asks for approval again.
 5. **Critical keys.** Every key of the emergency hotkey is always forwarded through the hooks instead of being discarded. `Ctrl+Alt+Del` is a secure attention sequence that cannot be intercepted, and the lock/UAC desktops stay reachable, so the human can always take the machine back.
 6. **One at a time.** Only one agent can hold the takeover. Another agent's input fails with `TAKEOVER_BUSY` until control is released.
 
 Approving from a phone is supported by the harness approval UI (for example through `dsh-pocket`); the mask itself is always drawn on the controlled Windows desktop.
 
+### Messaging the agent from the mask
+
+The chat panel at the bottom of the mask is interactive for the human's simulated pointer:
+
+- click the message box to start typing; `Enter` sends, `Shift+Enter` inserts a newline and `Esc` (or a click outside the panel) dismisses the editor without losing the text;
+- the message is delivered to the session that requested the takeover as a normal user message. It follows the **busy-Enter** behavior from DSH settings (`Settings → Conversation → Enter while busy`): `queue` adds it to the next turn, `steer` submits it to the next step. The panel shows the strategy in its status line;
+- **Cancel takeover** revokes the approval and ends the takeover immediately (fail closed: in-flight input aborts and the next input needs a new approval), without latching `PAUSED` like the emergency hotkey;
+- the right mouse button dismisses the editor. The real OS cursor stays with the agent; the white arrow is the human's pointer, so both can be seen at once.
+
 ## Safety
 
 - Input is real and **cannot be undone**; the plugin can interrupt, release keys and re-observe.
 - Approval and takeover are on by default. `input.requireApproval` is a deprecated alias for `consent.requireApproval`.
 - The emergency hotkey (default `Ctrl+Alt+Shift+F12`) pauses the helper, releases every button/modifier and refuses further input until the human presses it again.
-- While the takeover is active the mask discards physical mouse/keyboard input. Input injected by other software carries the same `injected` flag as the agent's own input, so the hooks cannot tell them apart.
+- While the takeover is active physical input never reaches the desktop; it is routed to the mask panel. Input injected by other software carries the same `injected` flag as the agent's own input, so the hooks cannot tell them apart.
+- Messages typed into the mask are delivered as ordinary user messages to the session; nothing is stored by the native helper.
 - `Win+L`, `Ctrl+Alt+Del` and `Win+U` are blocked for the agent by default (`input.blockedCombos`).
 - Optional process allow/deny lists: `safety.allowedProcesses` / `safety.blockedProcesses`.
 - Lock screens and UAC secure desktops report `SECURE_DESKTOP`; a non-elevated helper cannot inject into elevated windows (UIPI).
@@ -89,6 +100,7 @@ Override the plugin row in `cordis.patch.yml`; every field has a default:
       enabled: true
       opacity: 0.18       # 0.05 .. 0.9
       banner: true
+      chat: true          # interactive chat panel in the mask
       title: ""           # empty = localized default
       hint: ""            # empty = localized default with the hotkey
       idleEndMs: 0        # 0 = release when the agent turn ends
@@ -114,9 +126,10 @@ Override the plugin row in `cordis.patch.yml`; every field has a default:
 | `input.maxHoldMs` | 5000 | Maximum explicit button hold |
 | `consent.requireApproval` | true | Ask before the first input action; `input.requireApproval` still works as an alias |
 | `consent.scope` | turn | `turn` asks again next turn, `session` keeps one approval until the agent is disposed |
-| `takeover.enabled` | true | Mask the screen and discard physical input while the agent operates |
+| `takeover.enabled` | true | Mask the screen and route physical input to the mask panel while the agent operates |
 | `takeover.opacity` | 0.18 | Mask opacity, 0.05–0.9 |
 | `takeover.banner` | true | Show the banner with the emergency hotkey |
+| `takeover.chat` | true | Interactive chat panel in the mask: the human's pointer and keyboard go to the panel, not the desktop |
 | `takeover.title` / `hint` | empty | Banner text; empty uses a localized default |
 | `takeover.idleEndMs` | 0 | Release after this much inactivity; 0 releases when the turn ends |
 | `safety.hotkey` | ctrl+alt+shift+f12 | Emergency stop and takeover abort |
@@ -131,9 +144,10 @@ npm test                    # Node unit tests
 node scripts/smoke.mjs      # helper-level screenshot/window/mouse/clipboard test
 node scripts/notepad-test.mjs "$LOCALAPPDATA/dsh-computer-use/helper-test.exe"
 node scripts/takeover-test.mjs "$LOCALAPPDATA/dsh-computer-use/helper-test.exe"  # mask + hooks + emergency path
+node scripts/chat-test.mjs "$LOCALAPPDATA/dsh-computer-use/helper-test.exe"      # chat panel: compose, send, ack, cancel
 ```
 
-Run the native tests on a disposable desktop and stage the exe under `%LOCALAPPDATA%` first: a helper started from a low-integrity workspace can capture the screen but cannot inject input. The takeover test verifies the mask, capture exclusion, injected input passing through the hooks, host release and the emergency-stop path.
+Run the native tests on a disposable desktop and stage the exe under `%LOCALAPPDATA%` first: a helper started from a low-integrity workspace can capture the screen but cannot inject input. The takeover test verifies the mask, capture exclusion, injected input passing through the hooks, host release and the emergency-stop path. The chat test verifies compose-mode focus, the `HUMAN_COMPOSING` gate, sending a message, the ack path, the cancel button and focus restoration.
 
 The Rust helper lives in `native/` and speaks one JSON object per line over stdio. It handles one request at a time; the Host kills it on timeout/cancel and sends `input.release_all` after a restart. The takeover overlay and the hooks run on their own thread with a message loop; if the helper dies Windows removes the hooks and the overlay automatically.
 
@@ -145,6 +159,7 @@ The Rust helper lives in `native/` and speaks one JSON object per line over stdi
 - Unsigned native executables may trigger SmartScreen or antivirus prompts on some machines.
 - Multiple sessions share one desktop; takeover is coordinated in-process but not between independent DSH processes.
 - Some games and protected apps use Raw Input and may ignore `SendInput`.
+- While the human types in the mask panel, input actions wait up to 30 seconds for the panel to close and then fail with `HUMAN_COMPOSING`; the model sees a retryable error. The panel's editor is a standard Win32 EDIT, so the system IME (including Chinese) works, but the candidate window is drawn by the IME, not by the plugin.
 - The low-level hooks only cover the interactive desktop; secure desktops (UAC, lock screen) are unaffected, which is also what keeps `Ctrl+Alt+Del` available to the human.
 
 ## License

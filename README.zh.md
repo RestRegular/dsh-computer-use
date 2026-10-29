@@ -2,7 +2,7 @@
 
 中文 | [English](README.md)
 
-让 DeepSeek Harness 的 Agent 真正看见并操作 Windows 桌面：截屏、鼠标、键盘、窗口与剪贴板。所有操作先经过一次明确的人工授权；授权后进入「接管」状态——半透明蒙版覆盖整个屏幕、物理鼠标键盘被丢弃，直到本轮任务结束。核心能力由随包提供的 Rust 原生 helper 完成，不依赖浏览器或外部自动化程序。
+让 DeepSeek Harness 的 Agent 真正看见并操作 Windows 桌面：截屏、鼠标、键盘、窗口与剪贴板。所有操作先经过一次明确的人工授权；授权后进入「接管」状态——半透明蒙版覆盖整个屏幕，物理鼠标键盘不再落到桌面上，而是由蒙版自己绘制的模拟光标和聊天面板接管：你可以在蒙版里给发起接管的会话发消息，或直接取消接管。核心能力由随包提供的 Rust 原生 helper 完成，不依赖浏览器或外部自动化程序。
 
 ## 安装
 
@@ -41,23 +41,34 @@ dsh plugin --profile web add @restregular/dsh-computer-use
 1. **授权。** 每个回合的第一次鼠标/键盘动作都会走 DSH 审批弹窗。这要求会话的审批策略是 `ask`；如果是 `never`，审批会被自动拒绝，Agent 无法操作（fail closed）。`consent.scope: session` 可以让一次授权覆盖整个会话；`consent.requireApproval: false` 可以完全关闭授权。
 2. **接管。** 授权通过后，helper 会在真正注入输入之前启动接管：
    - 半透明蒙版覆盖整个虚拟桌面，顶部提示条显示当前状态和急停热键；
-   - 安装 `WH_KEYBOARD_LL` / `WH_MOUSE_LL` 低级钩子，默认丢弃所有**物理**鼠标和键盘事件，用户无法在 Agent 工作时操作电脑；
-   - Agent 通过 `SendInput` 注入的输入带有 `injected` 标志，会正常穿过钩子，因此蒙版不会妨碍 Agent 自己操作；
-   - 蒙版设置了 `WDA_EXCLUDEFROMCAPTURE`，模型的截图里看不到蒙版（老版本 Windows 不支持时，截图瞬间会短暂隐藏蒙版）；
-   - 蒙版鼠标穿透、不抢键盘焦点。
-3. **结束。** 回合结束（`agent/turn-stopping`）、Agent 主动调用 `computer_action` 的 `action: "release"`、Agent 被 dispose、急停热键、helper 退出时，控制权都会交还用户。`takeover.idleEndMs` 可设置空闲多久后自动释放。
+   - 安装 `WH_KEYBOARD_LL` / `WH_MOUSE_LL` 低级钩子，**物理**事件不再落到桌面。它们没有简单被丢弃：蒙版按物理位置绘制一个模拟光标，点击由蒙版底部的聊天面板处理（输入框、发送、取消接管）；
+   - 点击输入框会让面板里的多行 EDIT 获得键盘焦点，物理键盘（包括系统输入法）只进入蒙版里的消息，不会影响 Agent 正在操作的窗口。面板持有焦点期间，Agent 的注入输入会被拒绝并返回 `HUMAN_COMPOSING`；对应的动作会等面板收起后自动重试；
+   - Agent 通过 `SendInput` 注入的输入带有 `injected` 标志，会正常穿过钩子，因此蒙版不会妨碍 Agent 自己操作；面板本身鼠标穿透，Agent 点在面板下面的窗口也能收到；
+   - 蒙版、聊天面板和模拟光标都设置了 `WDA_EXCLUDEFROMCAPTURE`，模型的截图里看不到它们（老版本 Windows 不支持时，截图瞬间会短暂隐藏）；
+   - 蒙版本身不抢键盘焦点；只有用户主动点击输入框时，面板才会临时获得焦点。
+3. **结束。** 回合结束（`agent/turn-stopping`）、Agent 主动调用 `computer_action` 的 `action: "release"`、Agent 被 dispose、点击蒙版里的「取消接管」、急停热键、helper 退出时，控制权都会交还用户。`takeover.idleEndMs` 可设置空闲多久后自动释放。
 4. **急停。** 接管期间按急停热键（默认 `Ctrl+Alt+Shift+F12`）会立即结束接管、恢复用户输入、让 helper 进入 PAUSED 并撤销本回合授权。正在执行的动作以 `TAKEOVER_ENDED` 中止，后续输入报 `PAUSED`。模型不能自行恢复：需要用户再按一次热键解除 PAUSED，下一次输入还会重新请求授权。
 5. **关键按键。** 急停热键的所有组成键始终原样透传、不会被丢弃（helper 的轮询线程必须能看到它们）。`Ctrl+Alt+Del` 是安全注意序列，低级钩子无法拦截；锁屏/UAC 安全桌面也不受影响——用户始终能夺回机器。
 6. **同一时刻一个接管者。** 其他 Agent 的输入会返回 `TAKEOVER_BUSY`，直到控制被释放。
 
 在手机上通过 `dsh-pocket` 等通道审批也可以；蒙版本身始终画在被控制的 Windows 桌面上。
 
+### 在蒙版里给 Agent 发消息
+
+蒙版底部的聊天面板对用户的模拟光标可交互：
+
+- 点击输入框开始输入；`Enter` 发送，`Shift+Enter` 换行，`Esc`（或点击面板外）收起输入但保留文字；
+- 消息会作为一条普通用户消息发给**发起接管的会话**，发送策略跟随 DSH 设置里的「繁忙时按 Enter」（`设置 → 会话 → 繁忙时按 Enter`）：`queue` 排到下一回合，`steer` 插到下一步。面板状态栏会显示当前策略；
+- 「取消接管」会立即撤销本回合授权并结束接管（fail closed：正在执行的输入会中止，下一次输入需要重新授权），但不会像急停热键那样进入 `PAUSED`；
+- 右键可以收起输入框。系统的真实光标仍由 Agent 控制，白色箭头是你的模拟光标，两者可以同时看到。
+
 ## 安全
 
 - 输入是真实发生的，**不能撤销**；只能中断、释放按键并重新观察。
 - 授权与接管默认开启。`input.requireApproval` 是 `consent.requireApproval` 的过时别名，仍然兼容。
 - 急停热键（默认 `Ctrl+Alt+Shift+F12`）：按下后 helper 立即进入 PAUSED、释放所有按键，后续输入报 `PAUSED`；再按一次恢复。模型不能自行恢复。
-- 接管期间蒙版会丢弃物理鼠标键盘输入。其它软件注入的输入同样带 `injected` 标志，和 Agent 自己的输入无法区分。
+- 接管期间物理鼠标键盘不会落到桌面，而是交给蒙版面板处理；其它软件注入的输入同样带 `injected` 标志，和 Agent 自己的输入无法区分。
+- 蒙版里输入的消息会作为普通用户消息交给会话；原生 helper 不保存消息内容。
 - 默认拦截 `Win+L`、`Ctrl+Alt+Del`、`Win+U`，可通过 `input.blockedCombos` 调整。
 - 可选进程允许/拒绝列表：`safety.allowedProcesses` / `safety.blockedProcesses`。
 - 锁屏、UAC 安全桌面会报 `SECURE_DESKTOP`；非提权 helper 向提权窗口注入会被 UIPI 拦截，返回失败信息。
@@ -89,6 +100,7 @@ dsh plugin --profile web add @restregular/dsh-computer-use
       enabled: true
       opacity: 0.18       # 0.05 .. 0.9
       banner: true
+      chat: true          # 蒙版里的交互式聊天面板
       title: ""           # 留空使用本地化默认标题
       hint: ""            # 留空使用带热键的本地化默认提示
       idleEndMs: 0        # 0 = 回合结束时释放接管
@@ -114,9 +126,10 @@ dsh plugin --profile web add @restregular/dsh-computer-use
 | `input.maxHoldMs` | 5000 | 单次按住上限 |
 | `consent.requireApproval` | true | 第一次输入动作前请求授权；`input.requireApproval` 仍可作为别名 |
 | `consent.scope` | turn | `turn` 每回合重新授权，`session` 一次授权用到 Agent dispose |
-| `takeover.enabled` | true | Agent 操作时覆盖蒙版并丢弃物理输入 |
+| `takeover.enabled` | true | Agent 操作时覆盖蒙版，物理输入交给蒙版面板处理 |
 | `takeover.opacity` | 0.18 | 蒙版不透明度，0.05–0.9 |
 | `takeover.banner` | true | 显示带急停热键的提示条 |
+| `takeover.chat` | true | 蒙版里的交互式聊天面板：物理指针和键盘进入面板而不是桌面 |
 | `takeover.title` / `hint` | 空 | 提示条文案；留空用本地化默认值 |
 | `takeover.idleEndMs` | 0 | 空闲多久后释放接管；0 表示回合结束才释放 |
 | `safety.hotkey` | ctrl+alt+shift+f12 | 急停与终止接管热键 |
@@ -131,9 +144,10 @@ npm test                    # Node 单元测试
 node scripts/smoke.mjs      # 直接测试 helper：截图、窗口、鼠标、剪贴板
 node scripts/notepad-test.mjs "$LOCALAPPDATA/dsh-computer-use/helper-test.exe"  # 输入端到端测试
 node scripts/takeover-test.mjs "$LOCALAPPDATA/dsh-computer-use/helper-test.exe"  # 蒙版 + 钩子 + 急停
+node scripts/chat-test.mjs "$LOCALAPPDATA/dsh-computer-use/helper-test.exe"      # 聊天面板：输入、发送、回执、取消
 ```
 
-原生测试请在可弃置的桌面上运行，并先把 exe 复制到 `%LOCALAPPDATA%`：从低完整性工作区直接启动的 helper 能截图，但注入输入会被拒绝。接管测试会验证蒙版、截图排除、注入输入穿过钩子、Host 主动释放以及急停路径。
+原生测试请在可弃置的桌面上运行，并先把 exe 复制到 `%LOCALAPPDATA%`：从低完整性工作区直接启动的 helper 能截图，但注入输入会被拒绝。接管测试会验证蒙版、截图排除、注入输入穿过钩子、Host 主动释放以及急停路径；聊天面板测试会验证输入焦点、`HUMAN_COMPOSING` 门控、发送与回执、取消按钮和焦点恢复。
 
 Rust helper 位于 `native/`，使用 `windows-sys`、`image`、`serde_json`。它用一行一个 JSON 的协议与 Host 通信，一次只处理一个请求；Host 在超时/取消时杀掉 helper，重启后先发送 `input.release_all`。接管蒙版和钩子运行在独立线程的消息循环里；helper 退出时 Windows 会自动移除钩子和蒙版。
 
@@ -145,6 +159,7 @@ Rust helper 位于 `native/`，使用 `windows-sys`、`image`、`serde_json`。�
 - 未签名的原生 exe 在部分机器上可能触发 SmartScreen/杀软提示。
 - 多个会话共享同一桌面；接管只在单个 DSH 进程内协调，多个 DSH 进程之间不协调。
 - 某些游戏/受保护应用使用 Raw Input，可能忽略 `SendInput`。
+- 用户在蒙版输入框里打字时，Agent 的输入动作最多等待 30 秒，然后以 `HUMAN_COMPOSING` 失败（可重试）。输入框是标准 Win32 EDIT，系统输入法（含中文）可用；候选词窗口由输入法自己绘制，不属于插件。
 - 低级钩子只作用于交互桌面；UAC/锁屏等安全桌面不受影响——这也是 `Ctrl+Alt+Del` 始终留给用户的原因。
 
 ## License

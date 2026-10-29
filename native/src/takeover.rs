@@ -75,6 +75,67 @@ static END_REASON: Mutex<Option<String>> = Mutex::new(None);
 static END_TX: Mutex<Option<mpsc::Sender<(bool, String)>>> = Mutex::new(None);
 static EVENT_SINK: OnceLock<fn(&str, Value)> = OnceLock::new();
 
+/// Input dispatch and the mask chat panel share this gate. A running input
+/// command takes `busy`; the panel may only take the foreground while `busy`
+/// is zero, and after it does, every new input command is refused with
+/// `HUMAN_COMPOSING`. That closes the race where injected keys could land in
+/// the panel's EDIT control instead of the app the agent is operating.
+struct InputGate {
+    busy: u32,
+    composing: bool,
+}
+static INPUT_GATE: Mutex<InputGate> = Mutex::new(InputGate { busy: 0, composing: false });
+
+pub struct InputGuard;
+
+impl InputGuard {
+    pub fn acquire() -> HResult<Self> {
+        let mut gate = lock(&INPUT_GATE);
+        if gate.composing {
+            return Err(HelperError::new(
+                "HUMAN_COMPOSING",
+                "the human is typing a message in the takeover panel; wait for them to finish or cancel the takeover, then retry",
+            ));
+        }
+        gate.busy += 1;
+        Ok(InputGuard)
+    }
+}
+
+impl Drop for InputGuard {
+    fn drop(&mut self) {
+        let mut gate = lock(&INPUT_GATE);
+        gate.busy = gate.busy.saturating_sub(1);
+    }
+}
+
+pub fn input_guard() -> HResult<InputGuard> {
+    InputGuard::acquire()
+}
+
+pub fn is_composing() -> bool {
+    lock(&INPUT_GATE).composing
+}
+
+/// Give the chat panel the foreground for editing. Returns false while an
+/// input command is still running; the panel retries on a short timer.
+pub fn try_begin_composing() -> bool {
+    let mut gate = lock(&INPUT_GATE);
+    if gate.composing {
+        return true;
+    }
+    if gate.busy > 0 {
+        return false;
+    }
+    gate.composing = true;
+    true
+}
+
+pub fn finish_composing() {
+    lock(&INPUT_GATE).composing = false;
+}
+
+
 fn down_keys() -> &'static Mutex<HashSet<i32>> {
     DOWN_KEYS.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -94,17 +155,24 @@ fn emit(event: &str, data: Value) {
     }
 }
 
+/// Let the chat panel report human actions to the host.
+pub(crate) fn emit_ui_event(event: &str, data: Value) {
+    emit(event, data);
+}
+
 #[derive(Clone)]
 struct TakeoverConfig {
     opacity: u8,
     title: String,
     hint: String,
     banner: bool,
+    chat: Option<crate::chat::ChatConfig>,
 }
 
 struct InitInfo {
     overlay: bool,
     banner: bool,
+    chat: bool,
     capture_excluded: bool,
     monitors: usize,
 }
@@ -137,6 +205,8 @@ pub fn status_value() -> Value {
         "since": if since == 0 { Value::Null } else { json!(since) },
         "endedReason": reason,
         "hotkey": crate::hotkey::current_label(),
+        "composing": is_composing(),
+        "chat": crate::chat::snapshot_value(),
         "hooks": {
             "keysBlocked": HOOK_KEYS_BLOCKED.load(Ordering::SeqCst),
             "mouseBlocked": HOOK_MOUSE_BLOCKED.load(Ordering::SeqCst),
@@ -451,6 +521,12 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         }
         return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
     }
+    // The mask chat panel may own the keyboard while the human types a message.
+    // Only forward keys when the panel really holds the foreground; otherwise
+    // a physical key could reach the app the agent is operating.
+    if crate::chat::keyboard_should_pass() {
+        return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
+    }
     HOOK_KEYS_BLOCKED.fetch_add(1, Ordering::SeqCst);
     1
 }
@@ -461,6 +537,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     }
     let info = &*(lparam as *const MSLLHOOKSTRUCT);
     if ACTIVE.load(Ordering::SeqCst) && (info.flags & LLMHF_INJECTED) == 0 {
+        // The human's physical pointer is rendered and hit-tested by the mask
+        // chat panel; the OS cursor stays wherever the agent put it.
+        crate::chat::on_physical_mouse(wparam as u32, info.pt);
         HOOK_MOUSE_BLOCKED.fetch_add(1, Ordering::SeqCst);
         return 1;
     }
@@ -501,6 +580,7 @@ fn uninstall_hooks() {
 struct Session {
     tint: HWND,
     banner: HWND,
+    chat: bool,
     capture_excluded: bool,
 }
 
@@ -537,20 +617,12 @@ impl Session {
             let mut capture_excluded = SetWindowDisplayAffinity(tint, WDA_EXCLUDEFROMCAPTURE) != 0;
             ShowWindowAsync(tint, SW_SHOWNOACTIVATE);
             UpdateWindow(tint);
+            let mut banner = ptr::null_mut();
             if config.banner {
                 match create_banner(&config) {
-                    Ok((banner, banner_excluded)) => {
+                    Ok((handle, banner_excluded)) => {
+                        banner = handle;
                         capture_excluded = capture_excluded && banner_excluded;
-                        if install_hooks(instance).is_err() {
-                            DestroyWindow(banner);
-                            DestroyWindow(tint);
-                            return Err("could not install the input hooks".to_string());
-                        }
-                        return Ok(Session {
-                            tint,
-                            banner,
-                            capture_excluded,
-                        });
                     }
                     Err(error) => {
                         // The tint and hooks are the safety-critical part; a
@@ -559,16 +631,41 @@ impl Session {
                     }
                 }
             }
+            // The chat panel is optional as well: if it cannot be created the
+            // takeover still blocks all physical input like before.
+            let mut chat = false;
+            if let Some(chat_config) = config.chat.as_ref() {
+                match crate::chat::create(chat_config) {
+                    Ok(session) => {
+                        chat = true;
+                        capture_excluded = capture_excluded && session.capture_excluded;
+                    }
+                    Err(_) => {
+                        chat = false;
+                    }
+                }
+            }
             if let Err(error) = install_hooks(instance) {
+                crate::chat::destroy();
+                if !banner.is_null() {
+                    DestroyWindow(banner);
+                }
                 DestroyWindow(tint);
                 return Err(error);
             }
-            Ok(Session { tint, banner: ptr::null_mut(), capture_excluded })
+            Ok(Session {
+                tint,
+                banner,
+                chat,
+                capture_excluded,
+            })
         }
     }
 
     fn destroy(mut self) {
         uninstall_hooks();
+        crate::chat::destroy();
+        finish_composing();
         unsafe {
             if !self.banner.is_null() {
                 DestroyWindow(self.banner);
@@ -602,6 +699,7 @@ fn takeover_thread(config: TakeoverConfig, init: mpsc::Sender<Result<InitInfo, S
             let info = InitInfo {
                 overlay: true,
                 banner: !session.banner.is_null(),
+                chat: session.chat,
                 capture_excluded: session.capture_excluded,
                 monitors,
             };
@@ -626,7 +724,7 @@ fn takeover_thread(config: TakeoverConfig, init: mpsc::Sender<Result<InitInfo, S
     session.destroy();
     reset_generation(generation);
     let since = SINCE.load(Ordering::SeqCst);
-    if reason == "hotkey" || reason == "error" || reason == "debug" {
+    if reason == "hotkey" || reason == "error" || reason == "debug" || reason == "cancelled" {
         emit(
             "takeover.ended",
             json!({ "reason": reason, "since": since, "at": now_ms(), "hotkey": crate::hotkey::current_label() }),
@@ -661,6 +759,7 @@ fn reset_generation(generation: u64) {
         CAPTURE_EXCLUDED.store(false, Ordering::SeqCst);
         PREVIEW.store(false, Ordering::SeqCst);
         THREAD_ID.store(0, Ordering::SeqCst);
+        finish_composing();
     }
 }
 
@@ -695,6 +794,7 @@ pub fn begin(params: &Value) -> HResult<Value> {
             .unwrap_or("Press Ctrl+Alt+Shift+F12 to take back control")
             .to_string(),
         banner: params.get("banner").and_then(Value::as_bool).unwrap_or(true),
+        chat: params.get("chat").and_then(crate::chat::ChatConfig::from_json),
     };
 
     // Join a previous overlay thread that has already ended (for example after
@@ -735,6 +835,7 @@ pub fn begin(params: &Value) -> HResult<Value> {
         "hotkey": crate::hotkey::current_label(),
         "overlay": info.overlay,
         "banner": info.banner,
+        "chat": info.chat,
         "captureExcluded": info.capture_excluded,
         "monitors": info.monitors,
     }))
@@ -804,8 +905,23 @@ pub fn emergency_stop(reason: &str) {
     }
     CANCELLED.store(true, Ordering::SeqCst);
     crate::hotkey::set_paused(true);
+    finish_composing();
     let _ = crate::input::release_all();
     request_end(reason);
+}
+
+/// The human clicked "cancel takeover" in the mask chat panel. Fail closed like
+/// an emergency stop (abort in-flight input and refuse further injected input),
+/// but do not press the PAUSED latch: the human may approve a new takeover
+/// without pressing the hotkey first.
+pub fn cancel_from_ui() {
+    if !ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    CANCELLED.store(true, Ordering::SeqCst);
+    finish_composing();
+    let _ = crate::input::release_all();
+    request_end("cancelled");
 }
 
 /// Hide the overlay for a screenshot when display-affinity exclusion is not
@@ -825,6 +941,7 @@ pub fn hide_for_capture() -> bool {
     if banner != 0 {
         unsafe { ShowWindowAsync(banner as HWND, SW_HIDE) };
     }
+    crate::chat::hide_for_capture();
     sleep_ms(70);
     true
 }
@@ -841,6 +958,7 @@ pub fn finish_capture(hidden: bool) {
     if banner != 0 {
         unsafe { ShowWindowAsync(banner as HWND, SW_SHOWNOACTIVATE) };
     }
+    crate::chat::finish_capture(hidden);
     sleep_ms(30);
 }
 
@@ -868,6 +986,7 @@ pub fn disable_capture_exclusion() {
     if banner != 0 {
         unsafe { SetWindowDisplayAffinity(banner as HWND, windows_sys::Win32::UI::WindowsAndMessaging::WDA_NONE) };
     }
+    crate::chat::set_capture_affinity(false);
 }
 
 pub fn restore_capture_exclusion() {
@@ -880,6 +999,9 @@ pub fn restore_capture_exclusion() {
         if handle != 0 && unsafe { SetWindowDisplayAffinity(handle as HWND, WDA_EXCLUDEFROMCAPTURE) } == 0 {
             excluded = false;
         }
+    }
+    if !crate::chat::set_capture_affinity(true) {
+        excluded = false;
     }
     CAPTURE_EXCLUDED.store(excluded, Ordering::SeqCst);
 }

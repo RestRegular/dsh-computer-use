@@ -4,6 +4,7 @@
 //! stdout is reserved for protocol frames; diagnostics never go there.
 
 mod capture;
+mod chat;
 mod clipboard;
 mod hotkey;
 mod input;
@@ -143,6 +144,52 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             takeover::end(reason)
         }
         "takeover.status" => Ok(takeover::status_value()),
+        "takeover.chat.ack" => {
+            let ok = params.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            let note = params.get("note").and_then(Value::as_str).unwrap_or("");
+            chat::ack(ok, note);
+            Ok(json!({ "displayed": true }))
+        }
+        "debug.chat" => {
+            let action = params.get("action").and_then(Value::as_str).unwrap_or("");
+            match action {
+                "pointer" => {
+                    chat::debug_pointer(
+                        optional_int(params, "x").unwrap_or(0),
+                        optional_int(params, "y").unwrap_or(0),
+                    );
+                }
+                "click" => {
+                    chat::debug_click(
+                        optional_int(params, "x").unwrap_or(0),
+                        optional_int(params, "y").unwrap_or(0),
+                    );
+                }
+                "compose" => chat::debug(chat::DebugAction::Compose),
+                "send" => chat::debug(chat::DebugAction::Send),
+                "text" => {
+                    let text = params.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                    chat::debug(chat::DebugAction::Text(text));
+                }
+                "keys" => {
+                    let keys = params.get("keys").and_then(Value::as_str).unwrap_or("").to_string();
+                    chat::debug(chat::DebugAction::Keys(keys));
+                }
+                "press" => {
+                    let keys: Vec<String> = params
+                        .get("keys")
+                        .and_then(Value::as_array)
+                        .map(|values| values.iter().filter_map(Value::as_str).map(ToString::to_string).collect())
+                        .unwrap_or_default();
+                    if keys.is_empty() {
+                        return Err(HelperError::new("BAD_ARGS", "debug.chat press requires a non-empty keys array"));
+                    }
+                    chat::debug(chat::DebugAction::Press(keys));
+                }
+                other => return Err(HelperError::new("BAD_ARGS", format!("unknown debug.chat action: {other}"))),
+            }
+            Ok(json!({ "queued": true, "status": takeover::status_value() }))
+        }
         "debug.emergency" => {
             let reason = params.get("reason").and_then(Value::as_str).unwrap_or("debug");
             takeover::emergency_stop(reason);
@@ -156,23 +203,27 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
         }
         "windows.list" => window::list(),
         "window.focus" => {
+            let _guard = takeover::input_guard()?;
             let id = string_param(params, "window_id")?;
             let handle = window::parse(id)?;
             Ok(json!({ "window": window::focus(handle)? }))
         }
         "window.state" => {
+            let _guard = takeover::input_guard()?;
             let id = string_param(params, "window_id")?;
             let state = string_param(params, "state")?;
             let handle = window::parse(id)?;
             Ok(json!({ "window": window::set_state(handle, state)? }))
         }
         "mouse.move" => {
+            let _guard = takeover::input_guard()?;
             let x = int_param(params, "x")?;
             let y = int_param(params, "y")?;
             input::move_to(x, y)?;
             Ok(json!({ "x": x, "y": y }))
         }
         "mouse.move_rel" => {
+            let _guard = takeover::input_guard()?;
             let dx = int_param(params, "dx")?;
             let dy = int_param(params, "dy")?;
             let before = capture::cursor();
@@ -182,6 +233,7 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             Ok(json!({ "dx": dx, "dy": dy, "before": before, "after": after }))
         }
         "debug.set_cursor" => {
+            let _guard = takeover::input_guard()?;
             let x = int_param(params, "x")?;
             let y = int_param(params, "y")?;
             input::set_cursor(x, y)?;
@@ -192,6 +244,7 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
         "debug.env" => Ok(input::env_info()),
         "debug.token" => Ok(input::token_info()),
         "debug.set_cursor_thread" => {
+            let _guard = takeover::input_guard()?;
             let x = int_param(params, "x")?;
             let y = int_param(params, "y")?;
             input::set_cursor_on_thread(x, y)?;
@@ -199,6 +252,7 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             Ok(json!({ "cursor": capture::cursor() }))
         }
         "debug.raw_move" => {
+            let _guard = takeover::input_guard()?;
             let dx = int_param(params, "dx")?;
             let dy = int_param(params, "dy")?;
             let before = capture::cursor();
@@ -208,6 +262,7 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             Ok(json!({ "dx": dx, "dy": dy, "before": before, "after": after }))
         }
         "mouse.click" => {
+            let _guard = takeover::input_guard()?;
             let button = input::parse_button(params.get("button").and_then(Value::as_str))?;
             let clicks = params.get("clicks").and_then(Value::as_u64).unwrap_or(1) as u32;
             let hold_ms = params.get("hold_ms").and_then(Value::as_u64).unwrap_or(0);
@@ -216,6 +271,7 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             Ok(json!({ "clicks": clicks, "holdMs": hold_ms, "point": point }))
         }
         "mouse.drag" => {
+            let _guard = takeover::input_guard()?;
             let button = input::parse_button(params.get("button").and_then(Value::as_str))?;
             let from = (int_param(params, "from_x")?, int_param(params, "from_y")?);
             let to = (int_param(params, "to_x")?, int_param(params, "to_y")?);
@@ -225,6 +281,7 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             Ok(json!({ "from": from, "to": to, "durationMs": duration_ms, "steps": steps }))
         }
         "mouse.scroll" => {
+            let _guard = takeover::input_guard()?;
             let delta_x = optional_int(params, "delta_x").unwrap_or(0);
             let delta_y = optional_int(params, "delta_y").unwrap_or(0);
             if delta_x == 0 && delta_y == 0 {
@@ -235,11 +292,13 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             Ok(json!({ "deltaX": delta_x, "deltaY": delta_y }))
         }
         "key.press" => {
+            let _guard = takeover::input_guard()?;
             let keys = keys_param(params)?;
             input::press(&keys)?;
             Ok(json!({ "keys": keys }))
         }
         "type" => {
+            let _guard = takeover::input_guard()?;
             let text = string_param(params, "text")?;
             let interval_ms = params.get("interval_ms").and_then(Value::as_u64).unwrap_or(0);
             input::type_text(text, interval_ms)?;

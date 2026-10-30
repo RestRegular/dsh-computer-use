@@ -503,6 +503,7 @@ pub fn set_cursor_raw(x: i32, y: i32) -> HResult<()> {
     if unsafe { SetCursorPos(x, y) } == 0 {
         return Err(HelperError::new("INPUT_FAILED", format!("SetCursorPos failed: {}", last_error())));
     }
+    crate::takeover::note_cursor_position(windows_sys::Win32::Foundation::POINT { x, y });
     Ok(())
 }
 

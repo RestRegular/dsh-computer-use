@@ -253,6 +253,23 @@ fn dispatch(method: &str, params: &Value) -> HResult<Value> {
             util::sleep_ms(50);
             Ok(json!({ "cursor": capture::cursor(), "takeover": takeover::status_value() }))
         }
+        "debug.probe_mouse" => {
+            let ms = params.get("ms").and_then(Value::as_u64).unwrap_or(20_000);
+            let out = params.get("out").and_then(Value::as_str);
+            Ok(takeover::probe_mouse_events(ms, out))
+        }
+        "debug.trace_enable" => {
+            let on = params.get("on").and_then(Value::as_bool).unwrap_or(true);
+            if on {
+                takeover::clear_trace();
+            }
+            takeover::set_trace_enabled(on);
+            Ok(json!({ "enabled": on }))
+        }
+        "debug.trace" => {
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(400).min(1000) as usize;
+            Ok(takeover::hook_trace(limit))
+        }
         "debug.cursor_force" => {
             // Move the cursor the way the human's hand would: without updating
             // the takeover's pointer target, so `debug.pin_pointer` can prove

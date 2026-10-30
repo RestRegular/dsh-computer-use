@@ -29,17 +29,21 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE,
+    RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEMOUSE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PostThreadMessageW, RegisterClassExW,
-    SetCursorPos, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
-    ShowWindowAsync, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT,
-    LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_MOUSEMOVE, WM_PAINT,
-    WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PeekMessageW, PostThreadMessageW,
+    RegisterClassExW, SetCursorPos, SetLayeredWindowAttributes, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPos, ShowWindowAsync, TranslateMessage, UnhookWindowsHookEx,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
+    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WDA_EXCLUDEFROMCAPTURE,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN,
+    WM_MOUSEMOVE, WM_PAINT, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, GWL_EXSTYLE,
     GWLP_USERDATA, HWND_TOPMOST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, HHOOK};
@@ -66,6 +70,16 @@ static POINTER_TARGET: AtomicI64 = AtomicI64::new(i64::MIN);
 /// Only one pull-back may be queued at a time; otherwise a 1000 Hz mouse floods
 /// the overlay thread's message queue.
 static PIN_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Where the human's hand is, as opposed to where the OS cursor is. Pinning the
+/// cursor with `SetCursorPos` makes the low-level hook's `pt` meaningless (it
+/// reports a jitter around the pin), so the mask accumulates Raw Input deltas
+/// instead to draw a simulated pointer that can cross the screen.
+struct PointerState {
+    /// Accumulated physical pointer position (what the mask draws).
+    hand: POINT,
+}
+static POINTER_STATE: Mutex<Option<PointerState>> = Mutex::new(None);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -104,22 +118,45 @@ pub struct InputGuard;
 
 impl InputGuard {
     pub fn acquire() -> HResult<Self> {
-        let mut gate = lock(&INPUT_GATE);
-        if gate.composing {
-            return Err(HelperError::new(
-                "HUMAN_COMPOSING",
-                "the human is typing a message in the takeover panel; wait for them to finish or cancel the takeover, then retry",
-            ));
+        {
+            let mut gate = lock(&INPUT_GATE);
+            if gate.composing {
+                return Err(HelperError::new(
+                    "HUMAN_COMPOSING",
+                    "the human is typing a message in the takeover panel; wait for them to finish or cancel the takeover, then retry",
+                ));
+            }
+            gate.busy += 1;
         }
-        gate.busy += 1;
+        // The mask is hit-testable so pointer-based input (precision touchpad
+        // scrolling, mouse-in-pointer apps) lands on it and is swallowed. That
+        // must not eat the agent's own injected clicks, so the mask goes
+        // click-through for the duration of an input command.
+        set_click_through(true);
         Ok(InputGuard)
     }
 }
 
 impl Drop for InputGuard {
     fn drop(&mut self) {
-        let mut gate = lock(&INPUT_GATE);
-        gate.busy = gate.busy.saturating_sub(1);
+        let remaining = {
+            let mut gate = lock(&INPUT_GATE);
+            gate.busy = gate.busy.saturating_sub(1);
+            gate.busy
+        };
+        if remaining == 0 {
+            // Injected messages are hit-tested by the raw input thread a
+            // moment after SendInput returns; keep the mask click-through for
+            // a little longer so a click is not swallowed by its own shield.
+            let _ = thread::Builder::new()
+                .name("dsh-computer-use-unshield".to_string())
+                .spawn(|| {
+                    sleep_ms(60);
+                    if lock(&INPUT_GATE).busy == 0 {
+                        set_click_through(false);
+                    }
+                });
+        }
     }
 }
 
@@ -185,11 +222,62 @@ pub fn pointer_target() -> Option<POINT> {
 fn clear_pointer_target() {
     POINTER_TARGET.store(i64::MIN, Ordering::SeqCst);
     PIN_PENDING.store(false, Ordering::SeqCst);
+    *lock(&POINTER_STATE) = None;
 }
 
 fn current_cursor() -> Option<POINT> {
     let mut point = POINT { x: 0, y: 0 };
     if unsafe { GetCursorPos(&mut point) } == 0 { None } else { Some(point) }
+}
+
+/// Seed the hand position at takeover start.
+fn reset_pointer_state(cursor: POINT) {
+    *lock(&POINTER_STATE) = Some(PointerState { hand: cursor });
+}
+
+/// Fold one raw device delta (hardware counts, unaffected by the pinned cursor)
+/// into the hand position. This is the only reliable way to track a physical
+/// pointer while `SetCursorPos` keeps snapping the cursor back: the low-level
+/// hook only reports positions derived from that same cursor, and Windows drops
+/// the accumulated ballistics on every snap.
+fn advance_hand_raw(dx: i32, dy: i32) {
+    let mut state = lock(&POINTER_STATE);
+    let entry = state.get_or_insert(PointerState {
+        hand: current_cursor().unwrap_or(POINT { x: 0, y: 0 }),
+    });
+    entry.hand.x = entry.hand.x.saturating_add(dx).clamp(-100_000, 100_000);
+    entry.hand.y = entry.hand.y.saturating_add(dy).clamp(-100_000, 100_000);
+}
+
+/// Absolute devices report 0..65535 across the virtual desktop.
+fn advance_hand_absolute(x: i32, y: i32) {
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+    let point = POINT {
+        x: left + (x as i64 * width as i64 / 65535) as i32,
+        y: top + (y as i64 * height as i64 / 65535) as i32,
+    };
+    if let Some(state) = lock(&POINTER_STATE).as_mut() {
+        state.hand = point;
+    }
+}
+
+/// Whether to record a trace of physical events for diagnosis.
+static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_trace_enabled(value: bool) {
+    TRACE_ENABLED.store(value, Ordering::Relaxed);
+}
+
+/// Record where the OS cursor is after an out-of-band move. Kept for the debug
+/// protocol: raw input does not depend on it.
+pub fn note_cursor_position(_point: POINT) {}
+
+/// The simulated pointer position, for status and tests.
+pub fn hand_position() -> Option<POINT> {
+    lock(&POINTER_STATE).as_ref().map(|state| state.hand)
 }
 
 /// Queue a cursor pull-back on the overlay thread. Runs inside the low-level
@@ -236,6 +324,158 @@ pub fn debug_pin() {
 /// message loop, `SetCursorPos`) without needing a physical mouse.
 pub fn debug_post_pin() {
     pin_pointer();
+}
+
+/// Make the mask swallow input (`false`) or let it through (`true`).
+///
+/// The mask has to be hit-testable: precision touchpads deliver two-finger
+/// scrolling as `WM_POINTERWHEEL`, and Chromium-style apps take mouse input in
+/// pointer mode, so neither ever reaches a low-level mouse hook. With a
+/// hit-testable mask those messages land on it and are discarded. The agent's
+/// own injected clicks are classic input and must reach the app underneath, so
+/// the mask becomes click-through for the duration of an input command.
+pub fn set_click_through(value: bool) {
+    let tint = OVERLAY.load(Ordering::SeqCst);
+    if tint == 0 {
+        return;
+    }
+    let hwnd = tint as HWND;
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    let desired = if value { style | WS_EX_TRANSPARENT } else { style & !WS_EX_TRANSPARENT };
+    if desired != style {
+        unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired as isize) };
+    }
+}
+
+/// Every low-level mouse event seen by [`probe_mouse_events`]:
+/// `(at_ms, message, x, y, flags, mouse_data, extra_info)`.
+static PROBE_EVENTS: Mutex<Vec<(u64, u32, i32, i32, u32, u32, u64)>> = Mutex::new(Vec::new());
+
+/// Ring buffer of the last physical events while a takeover is active, so a
+/// live run can be explained afterwards. `WM_INPUT` entries carry the raw delta
+/// in `point`; hook entries carry the (pinned) cursor position.
+#[derive(Clone)]
+struct TraceEntry {
+    at: u64,
+    message: u32,
+    point: POINT,
+    expected: POINT,
+    target: Option<POINT>,
+    hand: POINT,
+}
+static TRACE: Mutex<Vec<TraceEntry>> = Mutex::new(Vec::new());
+
+fn push_trace(entry: TraceEntry) {
+    let mut trace = lock(&TRACE);
+    if trace.len() >= 1000 {
+        trace.remove(0);
+    }
+    trace.push(entry);
+}
+
+pub fn hook_trace(limit: usize) -> Value {
+    let trace = lock(&TRACE).clone();
+    let start = trace.len().saturating_sub(limit.clamp(1, 1000));
+    Value::Array(
+        trace[start..]
+            .iter()
+            .map(|entry| {
+                json!({
+                    "at": entry.at,
+                    "msg": format!("0x{:04X}", entry.message),
+                    "pt": { "x": entry.point.x, "y": entry.point.y },
+                    "expected": { "x": entry.expected.x, "y": entry.expected.y },
+                    "target": entry.target.map(|point| json!({ "x": point.x, "y": point.y })),
+                    "hand": { "x": entry.hand.x, "y": entry.hand.y },
+                })
+            })
+            .collect(),
+    )
+}
+
+pub fn clear_trace() {
+    lock(&TRACE).clear();
+}
+
+unsafe extern "system" fn probe_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let info = &*(lparam as *const MSLLHOOKSTRUCT);
+        let mut events = lock(&PROBE_EVENTS);
+        if events.len() < 30_000 {
+            events.push((
+                now_ms(),
+                wparam as u32,
+                info.pt.x,
+                info.pt.y,
+                info.flags,
+                info.mouseData,
+                info.dwExtraInfo as u64,
+            ));
+        }
+    }
+    CallNextHookEx(ptr::null_mut(), code, wparam, lparam)
+}
+
+/// Diagnostics: record what the low-level mouse hook actually receives for a
+/// while, so the host can tell a real mouse apart from input that never
+/// reaches `WH_MOUSE_LL` (precision touchpads deliver `WM_POINTER`).
+pub fn probe_mouse_events(ms: u64, path: Option<&str>) -> Value {
+    let instance = unsafe { GetModuleHandleW(ptr::null()) };
+    let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(probe_mouse_proc), instance, 0) };
+    if hook.is_null() {
+        return json!({ "error": format!("SetWindowsHookExW failed: {}", std::io::Error::last_os_error()) });
+    }
+    lock(&PROBE_EVENTS).clear();
+    let deadline = now_ms() + ms.clamp(100, 120_000);
+    let mut message: MSG = unsafe { std::mem::zeroed() };
+    while now_ms() < deadline {
+        unsafe {
+            while PeekMessageW(&mut message, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        sleep_ms(2);
+    }
+    unsafe { UnhookWindowsHookEx(hook) };
+    let events = lock(&PROBE_EVENTS).clone();
+
+    let mut messages: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let mut extra_info: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let mut injected = 0u32;
+    let mut moved = 0u32;
+    for (_, message, _, _, flags, _, extra) in &events {
+        *messages.entry(format!("0x{message:04X}")).or_insert(0) += 1;
+        *extra_info.entry(format!("0x{extra:X}")).or_insert(0) += 1;
+        if flags & LLMHF_INJECTED != 0 {
+            injected += 1;
+        }
+        if *message == WM_MOUSEMOVE {
+            moved += 1;
+        }
+    }
+    if let Some(path) = path {
+        let mut text = String::with_capacity(events.len() * 64);
+        for (at, message, x, y, flags, data, extra) in &events {
+            text.push_str(&format!(
+                "{{\"at\":{at},\"msg\":\"0x{message:04X}\",\"x\":{x},\"y\":{y},\"flags\":{flags},\"data\":{data},\"extra\":\"0x{extra:X}\"}}\n"
+            ));
+        }
+        let _ = std::fs::write(path, text);
+    }
+    let first = events.first().map(|event| json!({ "x": event.2, "y": event.3 }));
+    let last = events.last().map(|event| json!({ "x": event.2, "y": event.3 }));
+    json!({
+        "ms": ms,
+        "total": events.len(),
+        "injected": injected,
+        "moved": moved,
+        "messages": messages,
+        "extraInfo": extra_info,
+        "first": first,
+        "last": last,
+        "cursor": current_cursor().map(|point| json!({ "x": point.x, "y": point.y })),
+    })
 }
 
 /// Route helper-to-host events ("takeover.ended") to the protocol writer.
@@ -302,6 +542,7 @@ pub fn status_value() -> Value {
         "composing": is_composing(),
         "chat": crate::chat::snapshot_value(),
         "pointer": pointer_target().map(|point| json!({ "x": point.x, "y": point.y })),
+        "hand": hand_position().map(|point| json!({ "x": point.x, "y": point.y })),
         "hooks": {
             "keysBlocked": HOOK_KEYS_BLOCKED.load(Ordering::SeqCst),
             "mouseBlocked": HOOK_MOUSE_BLOCKED.load(Ordering::SeqCst),
@@ -508,6 +749,10 @@ unsafe extern "system" fn tint_proc(hwnd: HWND, message: u32, wparam: WPARAM, lp
             EndPaint(hwnd, &paint);
             0
         }
+        WM_INPUT => {
+            handle_raw_mouse(lparam);
+            0
+        }
         WM_DISPLAYCHANGE => {
             let bounds = virtual_bounds();
             SetWindowPos(
@@ -585,6 +830,71 @@ unsafe extern "system" fn banner_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     }
 }
 
+/// Receive physical mouse deltas from the raw input stack. These are hardware
+/// counts, so `SetCursorPos` pinning cannot erase them.
+unsafe fn handle_raw_mouse(lparam: LPARAM) {
+    let mut buffer = [0u8; 128];
+    let mut size = buffer.len() as u32;
+    let written = GetRawInputData(
+        lparam as *mut core::ffi::c_void,
+        RID_INPUT,
+        buffer.as_mut_ptr() as *mut core::ffi::c_void,
+        &mut size,
+        std::mem::size_of::<RAWINPUTHEADER>() as u32,
+    );
+    if written == u32::MAX || written == 0 {
+        return;
+    }
+    let raw = &*(buffer.as_ptr() as *const RAWINPUT);
+    if raw.header.dwType != RIM_TYPEMOUSE {
+        return;
+    }
+    let mouse = &raw.data.mouse;
+    if mouse.usFlags as u32 & MOUSE_MOVE_ABSOLUTE as u32 != 0 {
+        advance_hand_absolute(mouse.lLastX, mouse.lLastY);
+    } else if mouse.lLastX != 0 || mouse.lLastY != 0 {
+        advance_hand_raw(mouse.lLastX, mouse.lLastY);
+    } else {
+        return;
+    }
+    let hand = hand_position().unwrap_or(POINT { x: 0, y: 0 });
+    if TRACE_ENABLED.load(Ordering::Relaxed) {
+        push_trace(TraceEntry {
+            at: now_ms(),
+            message: WM_INPUT,
+            point: POINT { x: mouse.lLastX, y: mouse.lLastY },
+            expected: POINT { x: 0, y: 0 },
+            target: pointer_target(),
+            hand,
+        });
+    }
+    crate::chat::pointer_moved(hand);
+}
+
+fn register_raw_mouse(target: HWND) -> Result<(), String> {
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: target,
+    };
+    let ok = unsafe { RegisterRawInputDevices(&device, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
+    if ok == 0 {
+        return Err(format!("RegisterRawInputDevices failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn unregister_raw_mouse() {
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_REMOVE,
+        hwndTarget: ptr::null_mut(),
+    };
+    unsafe { RegisterRawInputDevices(&device, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
+}
+
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
@@ -639,9 +949,22 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
             return CallNextHookEx(ptr::null_mut(), code, wparam, lparam);
         }
+        // The physical `pt` is relative to the pinned cursor, so the hand
+        // position comes from raw input instead (see `WM_INPUT`).
+        let hand = hand_position().unwrap_or(info.pt);
+        if TRACE_ENABLED.load(Ordering::Relaxed) {
+            push_trace(TraceEntry {
+                at: now_ms(),
+                message: wparam as u32,
+                point: info.pt,
+                expected: info.pt,
+                target: pointer_target(),
+                hand,
+            });
+        }
         // The human's physical pointer is rendered and hit-tested by the mask
         // chat panel; the OS cursor stays wherever the agent put it.
-        crate::chat::on_physical_mouse(wparam as u32, info.pt);
+        crate::chat::on_physical_mouse(wparam as u32, hand);
         // Windows moves the system cursor for the physical move before this
         // hook sees it; queue a pull-back to the agent's position.
         pin_pointer();
@@ -700,7 +1023,11 @@ impl Session {
         let class_name = wide(TINT_CLASS);
         let tint = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                // Deliberately *not* WS_EX_TRANSPARENT: the mask must be
+                // hit-testable so pointer-based physical input is swallowed
+                // instead of reaching the app. Input commands flip it to
+                // click-through while they inject (see `set_click_through`).
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 class_name.as_ptr(),
                 wide("").as_ptr(),
                 WS_POPUP,
@@ -722,6 +1049,10 @@ impl Session {
             let mut capture_excluded = SetWindowDisplayAffinity(tint, WDA_EXCLUDEFROMCAPTURE) != 0;
             ShowWindowAsync(tint, SW_SHOWNOACTIVATE);
             UpdateWindow(tint);
+            // Raw mouse deltas drive the simulated pointer: the low-level hook
+            // only sees positions derived from the pinned cursor. Not fatal if
+            // it fails (the mask itself is what keeps the desktop safe).
+            let _ = register_raw_mouse(tint);
             let mut banner = ptr::null_mut();
             if config.banner {
                 match create_banner(&config) {
@@ -769,6 +1100,7 @@ impl Session {
 
     fn destroy(mut self) {
         uninstall_hooks();
+        unregister_raw_mouse();
         crate::chat::destroy();
         finish_composing();
         unsafe {
@@ -796,6 +1128,7 @@ fn takeover_thread(config: TakeoverConfig, init: mpsc::Sender<Result<InitInfo, S
     clear_pointer_target();
     if let Some(cursor) = current_cursor() {
         set_pointer_target(cursor);
+        reset_pointer_state(cursor);
     }
 
     let session = match Session::create(config) {

@@ -975,12 +975,12 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, message: u32, wparam: WPARAM, l
                         });
                     }
                     DebugAction::Pointer(x, y) => {
-                        LAST_POINTER.with(|cell| cell.set(point(x, y)));
+                        remember_pointer(point(x, y));
                         post_pointer();
                     }
                     DebugAction::Click(x, y) => {
                         let location = point(x, y);
-                        LAST_POINTER.with(|cell| cell.set(location));
+                        remember_pointer(location);
                         LAST_CLICK.with(|cell| cell.set(location));
                         with_ui(|ui| handle_click(ui, location));
                     }
@@ -1180,7 +1180,7 @@ pub fn create(config: &ChatConfig) -> Result<ChatSession, String> {
     let mut cursor = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut cursor) };
     position_pointer(&ui, cursor);
-    LAST_POINTER.with(|cell| cell.set(cursor));
+    remember_pointer(cursor);
 
     UI.with(|slot| *slot.borrow_mut() = Some(ui));
     unsafe {
@@ -1376,6 +1376,22 @@ pub fn is_visible() -> bool {
     VISIBLE.load(Ordering::SeqCst)
 }
 
+/// Mirrors `LAST_POINTER` (a thread-local on the overlay thread) so the main
+/// thread can report where the simulated pointer currently is.
+static POINTER_SCREEN: Mutex<Option<POINT>> = Mutex::new(None);
+
+fn remember_pointer(location: POINT) {
+    LAST_POINTER.with(|cell| cell.set(location));
+    *lock(&POINTER_SCREEN) = Some(location);
+}
+
+/// Move the simulated pointer (called from the takeover thread's raw input
+/// handler with the accumulated hand position).
+pub fn pointer_moved(location: POINT) {
+    remember_pointer(location);
+    post_pointer();
+}
+
 pub fn snapshot_value() -> Value {
     let snapshot = lock(&SNAPSHOT).clone();
     let panel = PANEL_HWND.load(Ordering::SeqCst);
@@ -1394,6 +1410,18 @@ pub fn snapshot_value() -> Value {
             })
         }
     };
+    let pointer_screen = lock(&POINTER_SCREEN).map(|point| json!({ "x": point.x, "y": point.y }));
+    let pointer_window = POINTER_HWND.load(Ordering::SeqCst);
+    let pointer_window = if pointer_window == 0 {
+        Value::Null
+    } else {
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(pointer_window as HWND, &mut rect) } == 0 {
+            Value::Null
+        } else {
+            json!({ "x": rect.left + 1, "y": rect.top + 1 })
+        }
+    };
     json!({
         "visible": snapshot.visible,
         "composing": snapshot.composing,
@@ -1401,6 +1429,8 @@ pub fn snapshot_value() -> Value {
         "textLength": snapshot.text_length,
         "status": snapshot.status,
         "bounds": bounds,
+        "pointerScreen": pointer_screen,
+        "pointerWindow": pointer_window,
     })
 }
 
@@ -1411,11 +1441,11 @@ pub fn on_physical_mouse(message: u32, location: POINT) {
     }
     match message {
         WM_MOUSEMOVE => {
-            LAST_POINTER.with(|cell| cell.set(location));
+            remember_pointer(location);
             post_pointer();
         }
         WM_LBUTTONDOWN => {
-            LAST_POINTER.with(|cell| cell.set(location));
+            remember_pointer(location);
             LAST_CLICK.with(|cell| cell.set(location));
             post_pointer();
             let panel = PANEL_HWND.load(Ordering::SeqCst);

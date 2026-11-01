@@ -37,7 +37,7 @@ export function apply(ctx, rawConfig) {
   control.attach();
   if (config.consent.requireApproval) {
     ctx.logger?.info?.(
-      '[dsh-computer-use] input actions ask for approval; the session approval policy must be "ask" (with "never" they are refused)',
+      '[dsh-computer-use] input actions ask for approval before the first action of a turn; sessions in full access (approval policy "never") run without a prompt',
     );
   }
   ctx.effect(() => () => {

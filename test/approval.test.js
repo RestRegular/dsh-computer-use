@@ -5,7 +5,7 @@ import { normalizeConfig } from '../lib/config.js';
 import { ComputerControl } from '../lib/control.js';
 import { registerApproval } from '../lib/approval.js';
 
-function harness(rawConfig = {}) {
+function harness(rawConfig = {}, services = {}) {
   const config = normalizeConfig(rawConfig);
   const helper = {
     calls: [],
@@ -36,6 +36,9 @@ function harness(rawConfig = {}) {
   const listeners = new Map();
   const ctx = {
     logger: { info() {}, warn() {}, debug() {} },
+    get(name) {
+      return services[name];
+    },
     on(event, handler) {
       listeners.set(event, handler);
       return () => listeners.delete(event);
@@ -45,13 +48,20 @@ function harness(rawConfig = {}) {
   return { config, control, listeners };
 }
 
-const execOf = (action, id = 'agent-a') => ({
+const execOf = (action, id = 'agent-a', session = undefined) => ({
   name: 'computer_action',
   arguments: { action },
-  agent: { id },
+  agent: { id, session },
 });
 
 const next = async () => ({ kind: 'allow' });
+
+/** Minimal stand-in for the harness approval service. */
+const approvalService = (policy) => ({
+  effectivePolicy() {
+    return policy;
+  },
+});
 
 test('the first input action asks for approval with a localized reason', async () => {
   const { listeners } = harness();
@@ -95,4 +105,39 @@ test('a failed action does not grant approval', async () => {
 test('consent.requireApproval:false disables the gate', () => {
   const { listeners } = harness({ consent: { requireApproval: false } });
   assert.equal(listeners.has('tools/pre-execute'), false);
+});
+
+test('full access (approval policy "never") runs input actions without a prompt', async () => {
+  const session = { id: 'session-a' };
+  const { listeners } = harness({}, { approval: approvalService('never') });
+  const gate = listeners.get('tools/pre-execute');
+  assert.equal((await gate(execOf('type', 'agent-a', session), next)).kind, 'allow');
+  assert.equal((await gate(execOf('click', 'agent-a', session), next)).kind, 'allow');
+});
+
+test('an "ask" session still gets the approval prompt', async () => {
+  const { listeners } = harness({}, { approval: approvalService('ask') });
+  const gate = listeners.get('tools/pre-execute');
+  const session = { id: 'session-a' };
+  assert.equal((await gate(execOf('type', 'agent-a', session), next)).kind, 'ask');
+});
+
+test('unknown approval state still asks (fail closed)', async () => {
+  // No approval service and no session: the gate cannot prove full access.
+  const { listeners } = harness();
+  const gate = listeners.get('tools/pre-execute');
+  assert.equal((await gate(execOf('type'), next)).kind, 'ask');
+  // A session whose policy cannot be read also asks.
+  const broken = harness({}, { approval: { effectivePolicy: () => undefined } });
+  const gateBroken = broken.listeners.get('tools/pre-execute');
+  assert.equal((await gateBroken(execOf('type', 'agent-a', { id: 'session-a' }), next)).kind, 'ask');
+});
+
+test('full access is also read from the permissions projection', async () => {
+  const session = { id: 'session-a' };
+  const { listeners } = harness({}, {
+    sessionProjections: { stateOf: () => ({ preset: 'danger-full-access', sandbox: 'danger-full-access', approval: 'never' }) },
+  });
+  const gate = listeners.get('tools/pre-execute');
+  assert.equal((await gate(execOf('type', 'agent-a', session), next)).kind, 'allow');
 });

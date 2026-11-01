@@ -2,7 +2,7 @@
 
 [中文](README.zh.md) | English
 
-Let DeepSeek Harness agents see and operate a real Windows desktop: screenshots, mouse, keyboard, windows and clipboard — behind an explicit human approval and a screen takeover. The mask is not a dead end for the human: it draws its own pointer and hosts a small chat panel, so the human can message the requesting session or cancel the takeover without touching the desktop the agent is driving. A small bundled Rust helper does the native work; no browser or external automation runtime is required.
+Let DeepSeek Harness agents see and operate a real Windows desktop: screenshots, mouse, keyboard, windows and clipboard — behind an explicit human approval (waived in full access) and a screen takeover. The mask is not a dead end for the human: it draws its own pointer and hosts a small chat panel, so the human can message the requesting session or cancel the takeover without touching the desktop the agent is driving. A small bundled Rust helper does the native work; no browser or external automation runtime is required.
 
 ## Install
 
@@ -38,7 +38,7 @@ Requirements: Windows 10/11 x64, DSH 0.2.1 or newer.
 
 ## Consent and takeover
 
-1. **Consent.** The first mouse/keyboard action of each turn goes through the harness approval prompt. This requires the session approval policy to be `ask`; with `never` the prompt is refused automatically and the agent cannot operate (fail closed). Set `consent.scope: session` to keep one approval for the whole session, or `consent.requireApproval: false` to remove the gate entirely.
+1. **Consent.** While the session approval policy is `ask`, the first mouse/keyboard action of each turn goes through the harness approval prompt. In **full access** (the `danger-full-access` permission preset, approval policy `never`) no prompt is shown: the plugin treats the user's full-access choice as consent and runs the action directly, because the harness would answer the ask with an automatic rejection — gating input there would only make the tools fail. The takeover mask, its Cancel takeover button and the emergency hotkey still apply in every mode. Set `consent.scope: session` to keep one approval for the whole session, or `consent.requireApproval: false` to remove the gate entirely.
 2. **Takeover.** After approval, the helper takes over before the first injected input:
    - a semi-transparent mask covers the whole virtual desktop, with a banner showing the title and the emergency hotkey;
    - low-level `WH_KEYBOARD_LL` / `WH_MOUSE_LL` hooks stop every **physical** event from reaching the desktop. Instead of being discarded, the human's pointer is drawn as a simulated cursor on the mask and its clicks are handled by the mask's chat panel (message box, Send, Cancel takeover);
@@ -127,7 +127,7 @@ Override the plugin row in `cordis.patch.yml`; every field has a default:
 | `input.typeIntervalMs` | 0 | Delay between typed characters |
 | `input.dragSteps` | 24 | Drag interpolation steps |
 | `input.maxHoldMs` | 5000 | Maximum explicit button hold |
-| `consent.requireApproval` | true | Ask before the first input action; `input.requireApproval` still works as an alias |
+| `consent.requireApproval` | true | Ask before the first input action while the approval policy is `ask`; in full access (`never`) actions run without a prompt. `input.requireApproval` still works as an alias |
 | `consent.scope` | turn | `turn` asks again next turn, `session` keeps one approval until the agent is disposed |
 | `takeover.enabled` | true | Mask the screen and route physical input to the mask panel while the agent operates |
 | `takeover.opacity` | 0.18 | Mask opacity, 0.05–0.9 |

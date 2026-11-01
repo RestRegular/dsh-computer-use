@@ -2,7 +2,7 @@
 
 中文 | [English](README.md)
 
-让 DeepSeek Harness 的 Agent 真正看见并操作 Windows 桌面：截屏、鼠标、键盘、窗口与剪贴板。所有操作先经过一次明确的人工授权；授权后进入「接管」状态——半透明蒙版覆盖整个屏幕，物理鼠标键盘不再落到桌面上，而是由蒙版自己绘制的模拟光标和聊天面板接管：你可以在蒙版里给发起接管的会话发消息，或直接取消接管。核心能力由随包提供的 Rust 原生 helper 完成，不依赖浏览器或外部自动化程序。
+让 DeepSeek Harness 的 Agent 真正看见并操作 Windows 桌面：截屏、鼠标、键盘、窗口与剪贴板。所有操作先经过一次明确的人工授权（完全权限模式下免确认）；授权后进入「接管」状态——半透明蒙版覆盖整个屏幕，物理鼠标键盘不再落到桌面上，而是由蒙版自己绘制的模拟光标和聊天面板接管：你可以在蒙版里给发起接管的会话发消息，或直接取消接管。核心能力由随包提供的 Rust 原生 helper 完成，不依赖浏览器或外部自动化程序。
 
 ## 安装
 
@@ -38,7 +38,7 @@ dsh plugin --profile web add @restregular/dsh-computer-use
 
 ## 授权与接管
 
-1. **授权。** 每个回合的第一次鼠标/键盘动作都会走 DSH 审批弹窗。这要求会话的审批策略是 `ask`；如果是 `never`，审批会被自动拒绝，Agent 无法操作（fail closed）。`consent.scope: session` 可以让一次授权覆盖整个会话；`consent.requireApproval: false` 可以完全关闭授权。
+1. **授权。** 会话审批策略为 `ask` 时，每个回合的第一次鼠标/键盘动作都会走 DSH 审批弹窗。**完全权限**模式下（`danger-full-access` 权限预设，审批策略 `never`）不再弹框：插件把用户的完全权限选择视作授权，直接执行动作——此时 harness 本来就会自动拒绝这类询问，继续拦截只会让工具失败。无论哪种模式，接管蒙版、蒙版里的「取消接管」和急停热键依然生效。`consent.scope: session` 可以让一次授权覆盖整个会话；`consent.requireApproval: false` 可以完全关闭授权。
 2. **接管。** 授权通过后，helper 会在真正注入输入之前启动接管：
    - 半透明蒙版覆盖整个虚拟桌面，顶部提示条显示当前状态和急停热键；
    - 安装 `WH_KEYBOARD_LL` / `WH_MOUSE_LL` 低级钩子，**物理**事件不再落到桌面。它们没有简单被丢弃：蒙版按物理位置绘制一个模拟光标，点击由蒙版底部的聊天面板处理（输入框、发送、取消接管）；
@@ -127,7 +127,7 @@ dsh plugin --profile web add @restregular/dsh-computer-use
 | `input.typeIntervalMs` | 0 | 逐字输入间隔 |
 | `input.dragSteps` | 24 | 拖拽插值步数 |
 | `input.maxHoldMs` | 5000 | 单次按住上限 |
-| `consent.requireApproval` | true | 第一次输入动作前请求授权；`input.requireApproval` 仍可作为别名 |
+| `consent.requireApproval` | true | 审批策略为 `ask` 时在第一次输入动作前请求授权；完全权限（`never`）下不弹框直接执行。`input.requireApproval` 仍可作为别名 |
 | `consent.scope` | turn | `turn` 每回合重新授权，`session` 一次授权用到 Agent dispose |
 | `takeover.enabled` | true | Agent 操作时覆盖蒙版，物理输入交给蒙版面板处理 |
 | `takeover.opacity` | 0.18 | 蒙版不透明度，0.05–0.9 |
